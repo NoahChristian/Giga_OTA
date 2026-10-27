@@ -51,6 +51,21 @@ static char const OTA_URL[]  = SECRET_OTA_URL;
 // so prove the mechanism over HTTP and add TLS afterwards.
 static bool const OTA_IS_HTTPS = false;
 
+// Is the payload a plain .bin, or an LZSS-compressed .ota container?
+//
+// RAW IS THE DEFAULT, AND IT IS THE WHOLE POINT. The documented way to build
+// an image needs Arduino's lzss.py, which is a ctypes shim over a .so that
+// does not exist on Windows. You can skip all of it: serve the .bin that
+// arduino-cli already produced and do not decompress.
+//
+// download() always writes to /fs/UPDATE.BIN.LZSS regardless of what the
+// payload actually is; decompress() is what produces /fs/UPDATE.BIN. In raw
+// mode we copy instead of decompressing, and the bootloader cannot tell the
+// difference - it only cares that /fs/UPDATE.BIN is a valid image.
+//
+// Set false to use a real .ota built with lzss.py + bin2ota.py.
+static bool const OTA_PAYLOAD_IS_RAW = true;
+
 Arduino_H7_Video       Display(800, 480, GigaDisplayShield);
 Arduino_GigaDisplayTouch TouchDetector;
 
@@ -398,6 +413,35 @@ static void buildUi(void) {
    says what stage it is in and reports the byte count afterwards, which is
    what the API can actually support.
    ------------------------------------------------------------------------- */
+// Raw mode's replacement for decompress(): copy what download() fetched into
+// the filename the bootloader looks for. Returns bytes copied, or -1.
+//
+// 8 KB at a time because this runs after ota.begin() has mounted the OTA
+// filesystem and there is plenty of heap; a byte-at-a-time copy of a 700 KB
+// image through FAT is painfully slow.
+static int copyRawToUpdateBin(void) {
+  FILE *in = fopen("/fs/UPDATE.BIN.LZSS", "rb");
+  if (!in) return -1;
+  FILE *out = fopen("/fs/UPDATE.BIN", "wb");
+  if (!out) { fclose(in); return -1; }
+
+  const size_t BUF = 8192;
+  uint8_t *buf = (uint8_t *)malloc(BUF);
+  if (!buf) { fclose(in); fclose(out); return -1; }
+
+  int total = 0;
+  size_t n;
+  while ((n = fread(buf, 1, BUF, in)) > 0) {
+    if (fwrite(buf, 1, n, out) != n) { total = -1; break; }
+    total += (int)n;
+  }
+
+  free(buf);
+  fclose(in);
+  fclose(out);
+  return total;
+}
+
 static void runOta(void) {
   char msg[160];
 
@@ -433,17 +477,28 @@ static void runOta(void) {
     setStatus(msg);
     return;
   }
-  snprintf(msg, sizeof(msg), "Downloaded %d bytes. Decompressing...", got);
+  snprintf(msg, sizeof(msg), "Downloaded %d bytes. %s...", got,
+           OTA_PAYLOAD_IS_RAW ? "Staging" : "Decompressing");
   setStatus(msg);
 
-  const int out = ota.decompress();
-  if (out < 0) {
-    snprintf(msg, sizeof(msg), "decompress() failed, error %d. Was the image "
-                               "built with lzss + bin2ota?", out);
-    setStatus(msg);
-    return;
+  int out;
+  if (OTA_PAYLOAD_IS_RAW) {
+    out = copyRawToUpdateBin();
+    if (out < 0) {
+      setStatus("Could not stage the image to /fs/UPDATE.BIN.");
+      return;
+    }
+  } else {
+    out = ota.decompress();
+    if (out < 0) {
+      snprintf(msg, sizeof(msg), "decompress() failed, error %d. Was the image "
+                                 "built with lzss + bin2ota?", out);
+      setStatus(msg);
+      return;
+    }
   }
-  snprintf(msg, sizeof(msg), "Decompressed %d bytes. Arming bootloader...", out);
+  snprintf(msg, sizeof(msg), "%s %d bytes. Arming bootloader...",
+           OTA_PAYLOAD_IS_RAW ? "Staged" : "Decompressed", out);
   setStatus(msg);
 
   if ((err = ota.update()) != Arduino_Portenta_OTA::Error::None) {
@@ -459,6 +514,65 @@ static void runOta(void) {
   Serial.println("OTA: armed, resetting");
   delay(1500);          // let the serial line drain before the reset
   ota.reset();
+}
+
+/* -------------------------------------------------------------------------
+   Joining, and re-joining
+
+   A FAILED JOIN MUST NOT BE TERMINAL. The obvious shape - try a few times in
+   setup(), give up, carry on - leaves a board that is permanently offline
+   after one bad moment at power-up, with no way back except a reset. On a
+   board whose entire purpose is to be updated remotely, that is the one
+   failure you cannot afford, because it is also the failure that takes away
+   your means of fixing it.
+   ------------------------------------------------------------------------- */
+#define WIFI_ATTEMPTS      4
+#define WIFI_ATTEMPT_MS    10000UL
+#define WIFI_RETRY_MS      30000UL
+
+static unsigned long wifi_lastTry = 0;
+
+// Waits while keeping LVGL and the dev commands alive, so the screen stays
+// readable and capturable through a slow join.
+static void busyWait(unsigned long ms) {
+  for (unsigned long t = millis(); millis() - t < ms; ) {
+    lv_timer_handler();
+    serviceDevCommands();
+    delay(5);
+  }
+}
+
+static bool tryJoinWiFi(void) {
+  wifi_lastTry = millis();
+
+  int status = WiFi.status();
+  for (int attempt = 1; attempt <= WIFI_ATTEMPTS && status != WL_CONNECTED; attempt++) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Connecting to WiFi (attempt %d/%d)...",
+             attempt, WIFI_ATTEMPTS);
+    setStatus(msg);
+    status = WiFi.begin(SSID, PASS);
+    if (status != WL_CONNECTED) busyWait(WIFI_ATTEMPT_MS);
+    status = WiFi.status();
+  }
+
+  if (status != WL_CONNECTED) {
+    lv_label_set_text(lbl_ip, "WiFi: not connected");
+    setStatus("WiFi join failed. Retrying in the background - check the "
+              "antenna and arduino_secrets.h.");
+    return false;
+  }
+
+  // After the join, every time: whd_wifi_on() re-arms PM2 on every radio
+  // power-up, so a reconnect silently undoes a one-shot disable.
+  disableWifiPowerSave();
+
+  char ipbuf[48];
+  snprintf(ipbuf, sizeof(ipbuf), "WiFi: %s   PS mode %lu",
+           WiFi.localIP().toString().c_str(), (unsigned long)wifi_ps_mode);
+  lv_label_set_text(lbl_ip, ipbuf);
+  setStatus("Ready. Tap Update to fetch a new image.");
+  return true;
 }
 
 /* -------------------------------------------------------------------------
@@ -491,46 +605,30 @@ void setup() {
     return;
   }
 
-  int status = WL_IDLE_STATUS;
-  for (int attempt = 1; attempt <= 3 && status != WL_CONNECTED; attempt++) {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Connecting to WiFi (attempt %d/3)...", attempt);
-    setStatus(msg);
-    status = WiFi.begin(SSID, PASS);
-    if (status != WL_CONNECTED) {
-      // Keep the dev commands alive through the slow path - a board that is
-      // failing to join is exactly when you want to capture the screen.
-      for (unsigned long t = millis(); millis() - t < 8000; ) {
-        lv_timer_handler();
-        serviceDevCommands();
-        delay(5);
-      }
-    }
-  }
-
-  if (status != WL_CONNECTED) {
-    setStatus("WiFi connection failed. Check arduino_secrets.h.");
-    lv_label_set_text(lbl_ip, "WiFi: not connected");
-    return;
-  }
-
-  disableWifiPowerSave();
-
-  char ipbuf[48];
-  snprintf(ipbuf, sizeof(ipbuf), "WiFi: %s   PS mode %lu",
-           WiFi.localIP().toString().c_str(), (unsigned long)wifi_ps_mode);
-  lv_label_set_text(lbl_ip, ipbuf);
-  setStatus("Ready. Tap Update to fetch a new image.");
+  tryJoinWiFi();
 }
 
 void loop() {
   lv_timer_handler();
   serviceDevCommands();
 
+  // Keep trying to get back on the network. Cheap, and it is what stops one
+  // bad moment at power-up from stranding the board for good.
+  if (WiFi.status() != WL_CONNECTED && millis() - wifi_lastTry > WIFI_RETRY_MS) {
+    tryJoinWiFi();
+  }
+
   // Outside the LVGL event callback, as above. Cleared first so a failed
   // attempt cannot re-trigger itself.
   if (ota_requested) {
     ota_requested = false;
+    if (WiFi.status() != WL_CONNECTED) {
+      // Worth its own message: "download failed" sent me looking at the
+      // server when the board simply had no network.
+      setStatus("Not on WiFi yet - cannot update. Waiting for a connection.");
+      lv_obj_clear_state(btn_update, LV_STATE_DISABLED);
+      return;
+    }
     runOta();
     // Only reached if the OTA did not happen; a success never returns.
     lv_obj_clear_state(btn_update, LV_STATE_DISABLED);

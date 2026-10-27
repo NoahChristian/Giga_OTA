@@ -21,7 +21,7 @@ counters, no log scraping, no "it probably worked".
 +--------------------------------------------+
 ```
 
-Status: **work in progress.** See [Where this has got to](#where-this-has-got-to).
+Status: **working.** Proven end to end on hardware. See [Where this has got to](#where-this-has-got-to).
 
 ---
 
@@ -385,14 +385,36 @@ Honest status, because a repo that overstates itself is worse than no repo.
 - [x] `mkota.py` validated against Arduino's official GIGA image
 - [x] Compression flag behaviour determined from that image
 - [x] Sketch builds, runs, and renders; screen capture over serial working
-- [x] QSPI confirmed partitioned on a real board — 4 partitions, OTA
+- [x] QSPI confirmed partitioned on a real board - 4 partitions, OTA
       partition 2 is 5120 kB, so no reformat needed
-- [x] WHD powersave disable confirmed `2 -> 0` (on a sibling board; not yet
-      re-confirmed on this one)
-- [ ] WiFi join on this board — waiting on an antenna
-- [ ] OTA proven end to end with Arduino's prebuilt image
-- [ ] OTA proven with a self-built image
+- [x] WHD powersave disable confirmed `2 -> 0`
+- [x] **OTA proven end to end on hardware with a self-built image**, served
+      as a plain `.bin` over local HTTP, with no LZSS and no `.ota` container
+- [ ] OTA proven with a real LZSS `.ota` (the documented path; untested here
+      because the raw path removed the need for it)
 - [ ] HTTPS path proven
+- [ ] Recovery from a bad image, and from a download interrupted mid-transfer
+
+### The run that proved it
+
+A board running 1.0.0 was pointed at a 739,280-byte `.bin` of 1.0.1 and told
+to update itself. Everything below was driven from the PC - the button press
+included - and both images are straight out of `dump_screen.py`:
+
+| before | after |
+|---|---|
+| ![before](docs/before_ota.png) | ![after](docs/ota_success.png) |
+
+```
+$ python tools/serve.py build/Giga_OTA.ino.bin
+$ python tools/sim_tap.py 400 330 COM12      # press Update
+  192.168.1.42 - "GET /UPDATE.ota HTTP/1.1" 200 -
+$ python tools/dump_screen.py COM12 after    # FW 1.0.1
+```
+
+No compression, no container, no `decompress()` - `download()` fetched the
+raw binary and `copyRawToUpdateBin()` moved it to the name the bootloader
+wants. That is the entire packaging story on Windows.
 
 If the remaining boxes stay unticked, this README explains how far it got and
 why, which is the useful half either way.
