@@ -1,0 +1,10 @@
+# Credentials and machine-specific settings. Copy arduino_secrets.h.example
+# to arduino_secrets.h and fill it in; the real file never goes in git.
+arduino_secrets.h
+
+# Build output
+build/
+*.bin
+*.elf
+*.lzss
+*.ota
