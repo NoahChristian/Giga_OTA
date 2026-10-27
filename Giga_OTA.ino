@@ -175,6 +175,15 @@ static int reportQspiPartitions(void) {
   auto table = reinterpret_cast<mbrTable *>(&buffer[buffer_size - sizeof(mbrTable)]);
   int found = 0;
 
+  // THE LBA FIELDS ARE NOT IN 512-BYTE SECTORS. MBRBlockDevice takes byte
+  // addresses (bd_addr_t) and stores them divided by max(erase_size, 512),
+  // which on this QSPI is 4096 - so assuming the usual 512 under-reports
+  // every partition by 8x. Worth getting right rather than eyeballing,
+  // because "is the OTA partition big enough for my image" is the one
+  // question this report exists to answer.
+  const uint32_t sector = (bd->get_erase_size() > 512)
+                            ? (uint32_t)bd->get_erase_size() : 512u;
+
   Serial.print("QSPI: chip is ");
   Serial.print((unsigned long)(bd->size() / (1024 * 1024)));
   Serial.println(" MB");
@@ -197,9 +206,9 @@ static int reportQspiPartitions(void) {
     Serial.print("  type 0x");
     Serial.print(e.type, HEX);
     Serial.print("  offset ");
-    Serial.print((unsigned long)e.lbaOffset * 512UL / 1024UL);
+    Serial.print((unsigned long)e.lbaOffset * sector / 1024UL);
     Serial.print(" kB  size ");
-    Serial.print((unsigned long)e.lbaSize * 512UL / 1024UL);
+    Serial.print((unsigned long)e.lbaSize * sector / 1024UL);
     Serial.println(" kB");
   }
 
@@ -209,9 +218,17 @@ static int reportQspiPartitions(void) {
     snprintf(qspi_summary, sizeof(qspi_summary),
              "QSPI: %d partition(s) - need at least 2, run QSPIFormat", found);
   } else {
+    // Size the OTA partition against this very sketch, since "big enough"
+    // is the only thing the number is for.
+    const unsigned long ota_kb =
+        (unsigned long)table->entries[1].lbaSize * sector / 1024UL;
     snprintf(qspi_summary, sizeof(qspi_summary),
-             "QSPI: %d partitions, OTA partition 2 is %lu kB",
-             found, (unsigned long)table->entries[1].lbaSize * 512UL / 1024UL);
+             "QSPI: %d partitions, OTA partition 2 is %lu kB", found, ota_kb);
+    // The sector size only matters when the number looks wrong, so it goes
+    // to the console rather than taking up screen width.
+    Serial.print("QSPI: LBA unit is ");
+    Serial.print((unsigned long)sector);
+    Serial.println(" bytes");
   }
 
   delete[] buffer;
@@ -347,6 +364,9 @@ static void buildUi(void) {
   lv_obj_align(lbl_ip, LV_ALIGN_CENTER, 0, -10);
 
   lbl_qspi = lv_label_create(scr);
+  lv_obj_set_width(lbl_qspi, 760);
+  lv_label_set_long_mode(lbl_qspi, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(lbl_qspi, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_text(lbl_qspi, qspi_summary);
   lv_obj_align(lbl_qspi, LV_ALIGN_CENTER, 0, 20);
 

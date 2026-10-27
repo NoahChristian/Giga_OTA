@@ -94,6 +94,19 @@ opaque. This sketch reads the partition table at boot and puts the answer on
 the screen so you are not guessing. If it says the flash is not partitioned,
 run `File > Examples > STM32H747_System > QSPIFormat` once.
 
+> **The LBA fields are not in 512-byte sectors.** If you read the MBR
+> yourself — and you should, since "is the OTA partition big enough for my
+> image" is the whole point — note that `MBRBlockDevice::partition()` takes
+> byte addresses (`bd_addr_t`) and stores them divided by
+> `max(erase_size, 512)`, which is **4096** on this QSPI. Assume the usual 512
+> and every partition reads 8x too small: the 5 MB OTA partition shows up as
+> 640 kB, which looks exactly like a board that needs reformatting. Use
+> `bd->get_erase_size()` rather than a constant.
+>
+> A quick sanity check if you are unsure: the four partitions should come out
+> in a 1:5:1:7 ratio whatever unit you divide by. If the ratio is right and
+> the absolute numbers look small, it is the unit, not the flash.
+
 > **That format erases the QSPI**, including stored WiFi credentials in
 > partition 3 and anything in partition 4. On a board in service, know what is
 > on there before you run it.
@@ -371,7 +384,12 @@ Honest status, because a repo that overstates itself is worse than no repo.
 - [x] `.ota` container format decoded
 - [x] `mkota.py` validated against Arduino's official GIGA image
 - [x] Compression flag behaviour determined from that image
-- [x] Sketch builds and runs; WHD powersave disable confirmed `2 -> 0`
+- [x] Sketch builds, runs, and renders; screen capture over serial working
+- [x] QSPI confirmed partitioned on a real board — 4 partitions, OTA
+      partition 2 is 5120 kB, so no reformat needed
+- [x] WHD powersave disable confirmed `2 -> 0` (on a sibling board; not yet
+      re-confirmed on this one)
+- [ ] WiFi join on this board — waiting on an antenna
 - [ ] OTA proven end to end with Arduino's prebuilt image
 - [ ] OTA proven with a self-built image
 - [ ] HTTPS path proven

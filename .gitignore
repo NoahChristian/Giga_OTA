@@ -8,3 +8,6 @@ build/
 *.elf
 *.lzss
 *.ota
+
+# Screen captures are a dev artefact, not source
+tools/captures/
