@@ -345,6 +345,81 @@ what blocks you.
 
 ---
 
+## Security: do not put this on a network you do not trust
+
+Read this before copying the pattern anywhere real. As written, **this
+mechanism has no authentication and no integrity protection worth the name**,
+and that is a property of the design, not an oversight you can configure away.
+
+### What an attacker can do
+
+The board fetches an image from a URL over plain HTTP and runs whatever comes
+back. So anyone who can answer that URL owns the board:
+
+- **Any machine on the same network** can ARP-spoof or DNS-spoof its way into
+  being the server. On open Wi-Fi this is trivial.
+- **Anything on the path** - a router, a captive portal, an upstream proxy -
+  can swap the body in flight.
+- **The host itself**, if you point it at a URL you do not control.
+
+The result is arbitrary code execution on the device, persistently, with no
+trace beyond a version number the attacker also controls.
+
+### What does not protect you
+
+- **The `.ota` CRC32 is a checksum, not a MAC.** It detects corruption and is
+  trivial to recompute for modified content. It stops bit-rot, not people.
+- **The bootloader's image check is a sanity check.** It verifies the first
+  word looks like a plausible ARM initial stack pointer. Any real firmware
+  image passes, including the attacker's.
+- **HTTPS alone is not sufficient, though it is necessary.** It stops the
+  path attacks, but you are still trusting whoever controls the host and the
+  certificate chain. It says the bytes arrived unmodified from *somewhere*,
+  not that they are *your* firmware.
+
+### What actually helps, roughly in order of effort
+
+1. **Keep the trigger local.** As written, an update only starts when someone
+   presses the button on the device. An attacker cannot initiate one
+   remotely; they have to be positioned at the moment you choose to update.
+   This narrows the window a great deal and costs nothing - think carefully
+   before adding a remote trigger (an MQTT topic, an HTTP endpoint) without
+   doing the rest of this list first.
+2. **Use HTTPS with a pinned CA**, and make sure certificate validation is
+   actually on - a TLS client that does not verify is theatre. On this board
+   that means a valid `cacert.pem` in QSPI partition 1. Note that enabling it
+   costs about 148 kB of flash, because the TLS stack is otherwise
+   dead-code-eliminated.
+3. **Sign the image and verify it on the device before arming.** This is the
+   only measure that makes the transport irrelevant. Embed a public key in
+   the firmware, ship a detached signature alongside the image, and verify
+   the staged file before calling `update()`. mbedTLS is already present on
+   this platform, so the primitives are there.
+4. **Use MCUboot.** The bootloader already on the board contains a complete
+   MCUboot with image validation and encrypted-image support - the strings
+   `MCUBoot_ECIES_v1`, `I-Swap type`, and `E-Image in the %s slot is not
+   valid!` are all in it. That is the supported route to signed, verified,
+   swap-with-rollback updates, and it is a different and much larger piece of
+   work than this repo.
+
+### Two more things worth knowing
+
+- **There is no rollback protection.** Even with signing, nothing here stops
+  an attacker replaying an *older, legitimately signed* image with a known
+  defect. Signed-and-versioned is a stronger requirement than signed.
+- **A failed update is safe; a malicious one is not.** The checks in this
+  sketch - Content-Length match, stall timeout, refusing to stage anything
+  short - protect against *accidents*: a dropped connection, a crashed
+  server, a flaky link. They are not security measures and an attacker simply
+  serves a complete, correct-length, malicious image.
+
+**Summary:** fine on a network you control, for a board you can reach
+physically. Not fine on open Wi-Fi, not fine for a device you cannot
+physically recover, and not fine for anything you would mind someone else
+controlling.
+
+---
+
 ## Getting started
 
 ```
@@ -393,7 +468,10 @@ Honest status, because a repo that overstates itself is worse than no repo.
 - [ ] OTA proven with a real LZSS `.ota` (the documented path; untested here
       because the raw path removed the need for it)
 - [ ] HTTPS path proven
-- [ ] Recovery from a bad image, and from a download interrupted mid-transfer
+- [x] **Recovery from an interrupted download proven on hardware** - the
+      board refused a half-image, stayed on its existing firmware, remained
+      usable, and took the next legitimate update normally
+- [ ] Signed images - see [Security](#security-do-not-put-this-on-a-network-you-do-not-trust)
 
 ### The run that proved it
 
@@ -411,6 +489,29 @@ $ python tools/sim_tap.py 400 330 COM12      # press Update
   192.168.1.42 - "GET /UPDATE.ota HTTP/1.1" 200 -
 $ python tools/dump_screen.py COM12 after    # FW 1.0.1
 ```
+
+Progress is real, not a spinner - `Content-Length` gives the denominator:
+
+![progress](docs/progress.png)
+
+### Failing safely
+
+`tools/serve_broken.py` serves a deliberately bad update so you can watch a
+failure before you need to survive one. It declares the full `Content-Length`
+and then either closes halfway (`truncate`) or holds the socket open sending
+nothing (`stall`).
+
+![recovery](docs/recovery.png)
+
+```
+$ python tools/serve_broken.py build/Giga_OTA.ino.bin truncate
+  sent 369640 of 739280 bytes, then truncate
+```
+
+The board gave up on its own, said so, and **did not touch
+`/fs/UPDATE.BIN`** - then took the next good update normally. That last part
+is the half people forget to test: recovering is not just surviving the
+failure, it is still being updatable afterwards.
 
 No compression, no container, no `decompress()` - `download()` fetched the
 raw binary and `copyRawToUpdateBin()` moved it to the name the bootloader

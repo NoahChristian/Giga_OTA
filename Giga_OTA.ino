@@ -36,6 +36,11 @@
 #include <Arduino_Portenta_OTA.h>
 #include <BlockDevice.h>
 
+// Not pulled in by WiFi.h, but part of the same SocketWrapper library that is
+// already linked. Needed to drive the HTTP GET ourselves instead of handing
+// it to the library's blocking download() - see downloadWithProgress().
+#include <utility/http_request.h>
+
 #include "arduino_secrets.h"
 
 // Bump this and push the new build over the air. Watching it change on the
@@ -71,6 +76,7 @@ Arduino_GigaDisplayTouch TouchDetector;
 
 static lv_obj_t *lbl_version;
 static lv_obj_t *lbl_status;
+static lv_obj_t *bar_progress;
 static lv_obj_t *lbl_ip;
 static lv_obj_t *lbl_qspi;
 static lv_obj_t *btn_update;
@@ -351,9 +357,28 @@ static void serviceDevCommands(void) {
    ------------------------------------------------------------------------- */
 static void setStatus(const char *s) {
   lv_label_set_text(lbl_status, s);
-  // The OTA path blocks, so without forcing a paint here the status line only
+  // Some stages block, so without forcing a paint here the status line only
   // ever shows the LAST message - the user sees nothing until it is over.
   lv_refr_now(NULL);
+}
+
+// Same, without the forced repaint: for the inner loops that are already
+// calling lv_timer_handler() every pass. Forcing a full refresh per chunk of
+// a 700 KB download makes the transfer measurably slower than the network.
+static void setStatusQuiet(const char *s) {
+  lv_label_set_text(lbl_status, s);
+}
+
+static void setProgress(int pct) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  lv_bar_set_value(bar_progress, pct, LV_ANIM_OFF);
+}
+
+static void showProgress(bool on) {
+  if (on) lv_obj_clear_flag(bar_progress, LV_OBJ_FLAG_HIDDEN);
+  else    lv_obj_add_flag(bar_progress, LV_OBJ_FLAG_HIDDEN);
+  setProgress(0);
 }
 
 static void onUpdateClicked(lv_event_t *e) {
@@ -394,6 +419,14 @@ static void buildUi(void) {
   lv_label_set_text(btn_lbl, "Update");
   lv_obj_center(btn_lbl);
 
+  // Hidden until an update starts, so the idle screen stays uncluttered.
+  bar_progress = lv_bar_create(scr);
+  lv_obj_set_size(bar_progress, 560, 24);
+  lv_obj_align(bar_progress, LV_ALIGN_BOTTOM_MID, 0, -70);
+  lv_bar_set_range(bar_progress, 0, 100);
+  lv_bar_set_value(bar_progress, 0, LV_ANIM_OFF);
+  lv_obj_add_flag(bar_progress, LV_OBJ_FLAG_HIDDEN);
+
   lbl_status = lv_label_create(scr);
   lv_label_set_text(lbl_status, "Idle");
   lv_obj_set_width(lbl_status, 760);
@@ -413,13 +446,122 @@ static void buildUi(void) {
    says what stage it is in and reports the byte count afterwards, which is
    what the API can actually support.
    ------------------------------------------------------------------------- */
-// Raw mode's replacement for decompress(): copy what download() fetched into
-// the filename the bootloader looks for. Returns bytes copied, or -1.
+/* -------------------------------------------------------------------------
+   Downloading, with the UI still alive
+
+   ota.download() is a blocking call with no progress reporting: it issues the
+   GET, then spins on `while (!rsp->is_message_complete()) delay(10);`. For a
+   700 KB image over WiFi that is the better part of a minute during which the
+   screen is frozen and the board looks dead. On an update mechanism that is
+   not a cosmetic problem - a user who thinks it has hung will reach for the
+   power, which is the one thing that must not happen mid-write.
+
+   So we run the same request ourselves. send() returns once the headers are
+   parsed and the body streams in through the callback, which means we own the
+   wait loop: we can pump LVGL, count bytes, and read Content-Length for a
+   real denominator.
+
+   Two things that fall out of doing it this way, both of which matter more
+   than the progress bar:
+
+     - A STALL TIMEOUT. If the server goes away mid-transfer,
+       is_message_complete() never becomes true and the library's loop spins
+       for ever. Here, no bytes for STALL_MS and we give up.
+     - A COMPLETENESS CHECK. Knowing the expected length is what lets us tell
+       a finished download from a truncated one, which is what stops a
+       half-image ever reaching /fs/UPDATE.BIN.
+   ------------------------------------------------------------------------- */
+#define DL_STALL_MS 15000UL
+
+static FILE             *dl_file;
+static volatile uint32_t dl_received;
+
+static void dlBodyCb(const char *data, uint32_t len) {
+  if (dl_file && len) fwrite(data, 1, len, dl_file);
+  dl_received += len;
+}
+
+static uint32_t contentLengthOf(HttpResponse *rsp) {
+  std::vector<std::string *> names = rsp->get_headers_fields();
+  std::vector<std::string *> values = rsp->get_headers_values();
+  for (size_t i = 0; i < names.size() && i < values.size(); i++) {
+    if (strcasecmp(names[i]->c_str(), "Content-Length") == 0) {
+      return (uint32_t)strtoul(values[i]->c_str(), NULL, 10);
+    }
+  }
+  return 0;   // chunked, or a server that did not say
+}
+
+// Returns bytes written, or a negative value on failure.
+// expectedOut receives Content-Length, or 0 if the server did not give one.
+static int downloadWithProgress(const char *url, const char *target,
+                                uint32_t *expectedOut) {
+  *expectedOut = 0;
+  dl_received = 0;
+
+  dl_file = fopen(target, "wb");
+  if (!dl_file) return -1;
+
+  HttpRequest req(WiFi.getNetwork(), HTTP_GET, url, mbed::callback(dlBodyCb));
+  HttpResponse *rsp = req.send(NULL, 0);
+  if (rsp == NULL) {
+    fclose(dl_file); dl_file = NULL;
+    return -(req.get_error() ? req.get_error() : 1);
+  }
+  if (rsp->get_status_code() != 200) {
+    const int code = rsp->get_status_code();
+    fclose(dl_file); dl_file = NULL;
+    return -code;
+  }
+
+  const uint32_t expected = contentLengthOf(rsp);
+  *expectedOut = expected;
+
+  uint32_t lastSeen = 0;
+  unsigned long lastChange = millis();
+
+  while (!rsp->is_message_complete()) {
+    const uint32_t now = dl_received;
+    if (now != lastSeen) { lastSeen = now; lastChange = millis(); }
+    else if (millis() - lastChange > DL_STALL_MS) {
+      fclose(dl_file); dl_file = NULL;
+      return -9001;      // stalled; the caller reports it as such
+    }
+
+    if (expected) {
+      setProgress((int)((uint64_t)now * 100 / expected));
+      char msg[96];
+      snprintf(msg, sizeof(msg), "Downloading %lu of %lu kB...",
+               (unsigned long)(now / 1024), (unsigned long)(expected / 1024));
+      setStatusQuiet(msg);
+    } else {
+      char msg[80];
+      snprintf(msg, sizeof(msg), "Downloading %lu kB (size unknown)...",
+               (unsigned long)(now / 1024));
+      setStatusQuiet(msg);
+    }
+
+    lv_timer_handler();
+    serviceDevCommands();
+    delay(20);
+  }
+
+  fclose(dl_file);
+  dl_file = NULL;
+  return (int)dl_received;
+}
+
+// Raw mode's replacement for decompress(): copy what the download fetched
+// into the filename the bootloader looks for. Returns bytes copied, or -1.
 //
 // 8 KB at a time because this runs after ota.begin() has mounted the OTA
 // filesystem and there is plenty of heap; a byte-at-a-time copy of a 700 KB
 // image through FAT is painfully slow.
-static int copyRawToUpdateBin(void) {
+//
+// Reports coarse progress - start, halfway, done - because this is the other
+// place the board sits silent for several seconds, and "staging" with a
+// moving bar reads very differently from a frozen screen.
+static int copyRawToUpdateBin(uint32_t expected) {
   FILE *in = fopen("/fs/UPDATE.BIN.LZSS", "rb");
   if (!in) return -1;
   FILE *out = fopen("/fs/UPDATE.BIN", "wb");
@@ -434,6 +576,12 @@ static int copyRawToUpdateBin(void) {
   while ((n = fread(buf, 1, BUF, in)) > 0) {
     if (fwrite(buf, 1, n, out) != n) { total = -1; break; }
     total += (int)n;
+
+    if (expected) setProgress((int)((uint64_t)total * 100 / expected));
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Staging %lu kB...", (unsigned long)(total / 1024));
+    setStatusQuiet(msg);
+    lv_timer_handler();
   }
 
   free(buf);
@@ -465,43 +613,90 @@ static void runOta(void) {
     return;
   }
 
-  snprintf(msg, sizeof(msg), "Downloading from %s ...", OTA_URL);
+  snprintf(msg, sizeof(msg), "Contacting %s ...", OTA_URL);
   setStatus(msg);
   Serial.print("OTA: downloading ");
   Serial.println(OTA_URL);
+  showProgress(true);
 
-  const int got = ota.download(OTA_URL, OTA_IS_HTTPS);
+  // HTTPS still goes through the library's own call: HttpsRequest needs a
+  // cert store set up, and the streaming path below is the HTTP one.
+  uint32_t expected = 0;
+  int got;
+  if (OTA_IS_HTTPS) {
+    got = ota.download(OTA_URL, true);
+  } else {
+    got = downloadWithProgress(OTA_URL, "/fs/UPDATE.BIN.LZSS", &expected);
+  }
+
+  if (got == -9001) {
+    showProgress(false);
+    snprintf(msg, sizeof(msg), "Download stalled after %lu kB - the server "
+                               "stopped sending. Nothing was changed.",
+             (unsigned long)(dl_received / 1024));
+    setStatus(msg);
+    Serial.println("OTA: download stalled; UPDATE.BIN left untouched");
+    return;
+  }
   if (got <= 0) {
+    showProgress(false);
     snprintf(msg, sizeof(msg), "Download failed, error %d. Is the server "
                                "running and reachable?", got);
     setStatus(msg);
     return;
   }
+
+  // THE CHECK THAT MAKES A FAILED UPDATE SURVIVABLE. A truncated image that
+  // reaches /fs/UPDATE.BIN is a brick on the next boot, and a download can be
+  // cut short by the server, the network or the board losing its association
+  // - none of which are rare. Refusing to stage anything short of
+  // Content-Length means an interrupted update costs nothing: the running
+  // firmware is untouched and /fs/UPDATE.BIN still holds whatever it held.
+  if (expected && (uint32_t)got != expected) {
+    showProgress(false);
+    snprintf(msg, sizeof(msg), "Truncated: got %d bytes of %lu. Refusing to "
+                               "stage it. Nothing was changed.",
+             got, (unsigned long)expected);
+    setStatus(msg);
+    Serial.print("OTA: truncated (");
+    Serial.print(got);
+    Serial.print(" of ");
+    Serial.print((unsigned long)expected);
+    Serial.println("); UPDATE.BIN left untouched");
+    return;
+  }
+
   snprintf(msg, sizeof(msg), "Downloaded %d bytes. %s...", got,
            OTA_PAYLOAD_IS_RAW ? "Staging" : "Decompressing");
   setStatus(msg);
+  setProgress(0);
 
   int out;
   if (OTA_PAYLOAD_IS_RAW) {
-    out = copyRawToUpdateBin();
+    out = copyRawToUpdateBin(expected ? expected : (uint32_t)got);
     if (out < 0) {
+      showProgress(false);
       setStatus("Could not stage the image to /fs/UPDATE.BIN.");
       return;
     }
   } else {
     out = ota.decompress();
     if (out < 0) {
+      showProgress(false);
       snprintf(msg, sizeof(msg), "decompress() failed, error %d. Was the image "
                                  "built with lzss + bin2ota?", out);
       setStatus(msg);
       return;
     }
   }
+
+  setProgress(100);
   snprintf(msg, sizeof(msg), "%s %d bytes. Arming bootloader...",
            OTA_PAYLOAD_IS_RAW ? "Staged" : "Decompressed", out);
   setStatus(msg);
 
   if ((err = ota.update()) != Arduino_Portenta_OTA::Error::None) {
+    showProgress(false);
     snprintf(msg, sizeof(msg), "ota.update() failed, error %d", (int)err);
     setStatus(msg);
     return;
@@ -510,9 +705,16 @@ static void runOta(void) {
   // update() only RECORDS the update. The bootloader applies it on the next
   // boot, and the only statement that it really happened is the bootloader's
   // own "I-Sketch updated" followed by a changed version on screen.
-  setStatus("Rebooting to apply the update...");
+  setStatus("Complete. Rebooting to apply the update...");
   Serial.println("OTA: armed, resetting");
-  delay(1500);          // let the serial line drain before the reset
+
+  // Hold the finished state on screen for a moment. Without this the last
+  // thing anyone sees is a half-drawn bar before the display goes, which
+  // reads like a crash rather than a success.
+  for (unsigned long t = millis(); millis() - t < 1500; ) {
+    lv_timer_handler();
+    delay(10);
+  }
   ota.reset();
 }
 
@@ -526,7 +728,7 @@ static void runOta(void) {
    failure you cannot afford, because it is also the failure that takes away
    your means of fixing it.
    ------------------------------------------------------------------------- */
-#define WIFI_ATTEMPTS      4
+#define WIFI_ATTEMPTS      8
 #define WIFI_ATTEMPT_MS    10000UL
 #define WIFI_RETRY_MS      30000UL
 
@@ -542,21 +744,56 @@ static void busyWait(unsigned long ms) {
   }
 }
 
+// Waits up to ms for the association, returning THE MOMENT it is up rather
+// than sitting out the full timeout. The earlier version slept the whole
+// 10 s whether or not the board had already joined, which made every attempt
+// cost the maximum and made a fast join indistinguishable from a slow one.
+static bool waitForConnect(unsigned long ms) {
+  for (unsigned long t = millis(); millis() - t < ms; ) {
+    if (WiFi.status() == WL_CONNECTED) return true;
+    lv_timer_handler();
+    serviceDevCommands();
+    delay(50);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
 static bool tryJoinWiFi(void) {
   wifi_lastTry = millis();
 
-  int status = WiFi.status();
-  for (int attempt = 1; attempt <= WIFI_ATTEMPTS && status != WL_CONNECTED; attempt++) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  int used = 0;
+  for (int attempt = 1; attempt <= WIFI_ATTEMPTS; attempt++) {
     char msg[64];
     snprintf(msg, sizeof(msg), "Connecting to WiFi (attempt %d/%d)...",
              attempt, WIFI_ATTEMPTS);
     setStatus(msg);
-    status = WiFi.begin(SSID, PASS);
-    if (status != WL_CONNECTED) busyWait(WIFI_ATTEMPT_MS);
-    status = WiFi.status();
+
+    Serial.print("[wifi] attempt ");
+    Serial.print(attempt);
+    Serial.print(": ");
+
+    const int rc = WiFi.begin(SSID, PASS);
+
+    // BREAK ON SUCCESS, AND DO NOT RE-READ. The previous version took
+    // begin()'s result, then unconditionally overwrote it with
+    // WiFi.status() before testing the loop condition - so a status that
+    // had not caught up yet sent it round again and called begin() a second
+    // time, tearing down an association that had just come up. A join that
+    // works can be undone by the code meant to check it.
+    if (rc == WL_CONNECTED || waitForConnect(WIFI_ATTEMPT_MS)) {
+      used = attempt;
+      Serial.println("connected");
+      break;
+    }
+
+    Serial.print("no (status ");
+    Serial.print(WiFi.status());
+    Serial.println(")");
   }
 
-  if (status != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED) {
     lv_label_set_text(lbl_ip, "WiFi: not connected");
     setStatus("WiFi join failed. Retrying in the background - check the "
               "antenna and arduino_secrets.h.");
@@ -567,11 +804,27 @@ static bool tryJoinWiFi(void) {
   // power-up, so a reconnect silently undoes a one-shot disable.
   disableWifiPowerSave();
 
-  char ipbuf[48];
+  char ipbuf[64];
   snprintf(ipbuf, sizeof(ipbuf), "WiFi: %s   PS mode %lu",
            WiFi.localIP().toString().c_str(), (unsigned long)wifi_ps_mode);
   lv_label_set_text(lbl_ip, ipbuf);
-  setStatus("Ready. Tap Update to fetch a new image.");
+
+  // SAY WHICH ATTEMPT WORKED. The status line used to show the attempt
+  // currently in progress and was then immediately replaced by "Ready", so
+  // the number that succeeded was never displayed - the last one you could
+  // catch was whichever was in flight when you happened to look, which makes
+  // every join look like it took every attempt. Reporting it after the fact
+  // turns that into a fact instead of an impression.
+  char msg[96];
+  snprintf(msg, sizeof(msg),
+           "Ready (joined on attempt %d of %d). Tap Update to fetch a new image.",
+           used, WIFI_ATTEMPTS);
+  setStatus(msg);
+
+  Serial.print("[wifi] joined on attempt ");
+  Serial.print(used);
+  Serial.print(" of ");
+  Serial.println(WIFI_ATTEMPTS);
   return true;
 }
 
