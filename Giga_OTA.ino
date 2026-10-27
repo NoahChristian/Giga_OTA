@@ -41,6 +41,12 @@
 // it to the library's blocking download() - see downloadWithProgress().
 #include <utility/http_request.h>
 
+// Already compiled into the core's libmbed.a; only the headers need naming.
+#include <mbedtls/pk.h>
+#include <mbedtls/sha256.h>
+
+#include "ota_pubkey.h"
+
 #include "arduino_secrets.h"
 
 // Bump this and push the new build over the air. Watching it change on the
@@ -70,6 +76,19 @@ static bool const OTA_IS_HTTPS = false;
 //
 // Set false to use a real .ota built with lzss.py + bin2ota.py.
 static bool const OTA_PAYLOAD_IS_RAW = true;
+
+// Refuse to install an image that is not signed by the key in ota_pubkey.h.
+//
+// LEAVE THIS ON. Without it the board runs whatever answers the URL, which
+// means anyone who can impersonate that host - trivial on a network you do
+// not control - owns the device permanently. Signing is the only measure
+// here that makes the transport irrelevant: HTTP or HTTPS, a hostile server
+// or a hostile router, an image that is not signed by the matching private
+// key is rejected before anything is staged.
+//
+// Turning it off is for bringing up a board before you have a key, nothing
+// else.
+static bool const OTA_REQUIRE_SIGNATURE = true;
 
 Arduino_H7_Video       Display(800, 480, GigaDisplayShield);
 Arduino_GigaDisplayTouch TouchDetector;
@@ -551,6 +570,130 @@ static int downloadWithProgress(const char *url, const char *target,
   return (int)dl_received;
 }
 
+/* -------------------------------------------------------------------------
+   Signature verification
+
+   The signature is a trailer on the downloaded file:
+
+       [ firmware bytes ][ ECDSA signature, DER ][ uint16 siglen ][ 'GSG1' ]
+
+   Magic last, so the trailer can be found by seeking to the end without
+   knowing anything about the image first. ECDSA P-256 over SHA-256 of the
+   FIRMWARE BYTES ONLY - the trailer cannot sign itself.
+
+   The board carries only the public key, so reading the flash off a board
+   does not let anyone sign for it. That is the difference between this and a
+   shared secret, and it is the whole reason to prefer it.
+
+   Verification happens BEFORE staging, so a rejected image never reaches
+   /fs/UPDATE.BIN and the running firmware is untouched.
+   ------------------------------------------------------------------------- */
+#define SIG_MAGIC_0 'G'
+#define SIG_MAGIC_1 'S'
+#define SIG_MAGIC_2 'G'
+#define SIG_MAGIC_3 '1'
+#define SIG_TRAILER_FIXED 6
+
+// On success sets *fwLen to the firmware length (trailer excluded).
+// why[] receives a short human-readable reason on failure.
+static bool verifyImageSignature(const char *path, uint32_t *fwLen,
+                                 char *why, size_t whySize) {
+  *fwLen = 0;
+
+  FILE *f = fopen(path, "rb");
+  if (!f) { snprintf(why, whySize, "cannot reopen the downloaded file"); return false; }
+
+  fseek(f, 0, SEEK_END);
+  const long total = ftell(f);
+  if (total < (long)SIG_TRAILER_FIXED + 64) {
+    fclose(f); snprintf(why, whySize, "file too small to be a signed image");
+    return false;
+  }
+
+  uint8_t tail[SIG_TRAILER_FIXED];
+  fseek(f, total - SIG_TRAILER_FIXED, SEEK_SET);
+  if (fread(tail, 1, SIG_TRAILER_FIXED, f) != SIG_TRAILER_FIXED) {
+    fclose(f); snprintf(why, whySize, "could not read the trailer"); return false;
+  }
+
+  if (tail[2] != SIG_MAGIC_0 || tail[3] != SIG_MAGIC_1 ||
+      tail[4] != SIG_MAGIC_2 || tail[5] != SIG_MAGIC_3) {
+    fclose(f);
+    snprintf(why, whySize, "image is not signed");
+    return false;
+  }
+
+  const uint16_t siglen = (uint16_t)(tail[0] | (tail[1] << 8));
+  const long fw = total - SIG_TRAILER_FIXED - (long)siglen;
+  if (siglen == 0 || siglen > 160 || fw <= 0) {
+    fclose(f); snprintf(why, whySize, "signature length %u is implausible",
+                        (unsigned)siglen);
+    return false;
+  }
+
+  uint8_t sig[160];
+  fseek(f, fw, SEEK_SET);
+  if (fread(sig, 1, siglen, f) != siglen) {
+    fclose(f); snprintf(why, whySize, "could not read the signature"); return false;
+  }
+
+  // Hash the firmware in chunks: 590 KB will not fit in RAM, and the point
+  // of a streaming hash is that it never has to.
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+  mbedtls_sha256_starts_ret(&sha, 0);
+
+  const size_t BUF = 4096;
+  uint8_t *buf = (uint8_t *)malloc(BUF);
+  if (!buf) {
+    mbedtls_sha256_free(&sha); fclose(f);
+    snprintf(why, whySize, "out of memory hashing the image"); return false;
+  }
+
+  fseek(f, 0, SEEK_SET);
+  long left = fw;
+  while (left > 0) {
+    const size_t want = (left < (long)BUF) ? (size_t)left : BUF;
+    const size_t n = fread(buf, 1, want, f);
+    if (n == 0) break;
+    mbedtls_sha256_update_ret(&sha, buf, n);
+    left -= (long)n;
+
+    setProgress((int)(((fw - left) * 100) / fw));
+    lv_timer_handler();
+  }
+  free(buf);
+  fclose(f);
+
+  uint8_t hash[32];
+  mbedtls_sha256_finish_ret(&sha, hash);
+  mbedtls_sha256_free(&sha);
+
+  if (left != 0) { snprintf(why, whySize, "short read while hashing"); return false; }
+
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+  int rc = mbedtls_pk_parse_public_key(&pk,
+             (const unsigned char *)OTA_PUBLIC_KEY_PEM,
+             sizeof(OTA_PUBLIC_KEY_PEM));      // sizeof: the NUL must be counted
+  if (rc != 0) {
+    mbedtls_pk_free(&pk);
+    snprintf(why, whySize, "built-in public key will not parse (%d)", rc);
+    return false;
+  }
+
+  rc = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, siglen);
+  mbedtls_pk_free(&pk);
+
+  if (rc != 0) {
+    snprintf(why, whySize, "signature does not match this board's key");
+    return false;
+  }
+
+  *fwLen = (uint32_t)fw;
+  return true;
+}
+
 // Raw mode's replacement for decompress(): copy what the download fetched
 // into the filename the bootloader looks for. Returns bytes copied, or -1.
 //
@@ -561,7 +704,10 @@ static int downloadWithProgress(const char *url, const char *target,
 // Reports coarse progress - start, halfway, done - because this is the other
 // place the board sits silent for several seconds, and "staging" with a
 // moving bar reads very differently from a frozen screen.
-static int copyRawToUpdateBin(uint32_t expected) {
+// `limit` is how many bytes to copy, which for a signed image is the firmware
+// length WITHOUT the signature trailer - the bootloader must never see the
+// trailer, and the verified length is exactly what says where it starts.
+static int copyRawToUpdateBin(uint32_t limit) {
   FILE *in = fopen("/fs/UPDATE.BIN.LZSS", "rb");
   if (!in) return -1;
   FILE *out = fopen("/fs/UPDATE.BIN", "wb");
@@ -571,13 +717,16 @@ static int copyRawToUpdateBin(uint32_t expected) {
   uint8_t *buf = (uint8_t *)malloc(BUF);
   if (!buf) { fclose(in); fclose(out); return -1; }
 
-  int total = 0;
-  size_t n;
-  while ((n = fread(buf, 1, BUF, in)) > 0) {
-    if (fwrite(buf, 1, n, out) != n) { total = -1; break; }
-    total += (int)n;
+  uint32_t total = 0;
+  while (total < limit) {
+    const uint32_t room = limit - total;
+    const size_t want = (room < BUF) ? (size_t)room : BUF;
+    const size_t n = fread(buf, 1, want, in);
+    if (n == 0) break;
+    if (fwrite(buf, 1, n, out) != n) { total = 0; break; }
+    total += (uint32_t)n;
 
-    if (expected) setProgress((int)((uint64_t)total * 100 / expected));
+    setProgress((int)((uint64_t)total * 100 / limit));
     char msg[64];
     snprintf(msg, sizeof(msg), "Staging %lu kB...", (unsigned long)(total / 1024));
     setStatusQuiet(msg);
@@ -587,13 +736,24 @@ static int copyRawToUpdateBin(uint32_t expected) {
   free(buf);
   fclose(in);
   fclose(out);
-  return total;
+  return (total == limit) ? (int)total : -1;
 }
 
 static void runOta(void) {
   char msg[160];
 
-  Arduino_Portenta_OTA_QSPI ota(QSPI_FLASH_FATFS_MBR, 2);
+  // ONE OBJECT AND ONE begin() FOR THE WHOLE BOOT.
+  //
+  // Constructing Arduino_Portenta_OTA_QSPI per attempt looks tidier and is
+  // wrong: its init() does `new mbed::FATFileSystem("fs")` and mounts it, and
+  // nothing unmounts on the way out. The second attempt in a session then
+  // fails with OtaStorageInit (-3) because that name is already mounted - so
+  // ANY failed update, including one correctly rejected for a bad signature,
+  // left the board unable to retry until it was rebooted. That turns a
+  // recoverable failure into a trip to the hardware, which is the opposite of
+  // what this exists for.
+  static Arduino_Portenta_OTA_QSPI ota(QSPI_FLASH_FATFS_MBR, 2);
+  static bool storage_ready = false;
   Arduino_Portenta_OTA::Error err = Arduino_Portenta_OTA::Error::None;
 
   if (!ota.isOtaCapable()) {
@@ -605,12 +765,15 @@ static void runOta(void) {
     return;
   }
 
-  setStatus("Initialising OTA storage...");
-  if ((err = ota.begin()) != Arduino_Portenta_OTA::Error::None) {
-    snprintf(msg, sizeof(msg), "ota.begin() failed, error %d. Is the QSPI "
-                               "partitioned? See the boot log.", (int)err);
-    setStatus(msg);
-    return;
+  if (!storage_ready) {
+    setStatus("Initialising OTA storage...");
+    if ((err = ota.begin()) != Arduino_Portenta_OTA::Error::None) {
+      snprintf(msg, sizeof(msg), "ota.begin() failed, error %d. Is the QSPI "
+                                 "partitioned? See the boot log.", (int)err);
+      setStatus(msg);
+      return;
+    }
+    storage_ready = true;
   }
 
   snprintf(msg, sizeof(msg), "Contacting %s ...", OTA_URL);
@@ -666,14 +829,39 @@ static void runOta(void) {
     return;
   }
 
-  snprintf(msg, sizeof(msg), "Downloaded %d bytes. %s...", got,
-           OTA_PAYLOAD_IS_RAW ? "Staging" : "Decompressing");
+  // VERIFY BEFORE STAGING. Everything up to here has only written a temporary
+  // file; /fs/UPDATE.BIN still holds whatever it held. An image that fails
+  // this check is discarded without the bootloader ever being told about it.
+  uint32_t fwLen = (uint32_t)got;
+  if (OTA_PAYLOAD_IS_RAW) {
+    char why[96];
+    setStatus("Verifying signature...");
+    setProgress(0);
+
+    if (verifyImageSignature("/fs/UPDATE.BIN.LZSS", &fwLen, why, sizeof(why))) {
+      Serial.println("OTA: signature OK");
+    } else if (OTA_REQUIRE_SIGNATURE) {
+      showProgress(false);
+      snprintf(msg, sizeof(msg), "REJECTED: %s. Nothing was changed.", why);
+      setStatus(msg);
+      Serial.print("OTA: rejected - ");
+      Serial.println(why);
+      return;
+    } else {
+      Serial.print("OTA: unsigned image accepted - ");
+      Serial.println(why);
+      fwLen = (uint32_t)got;
+    }
+  }
+
+  snprintf(msg, sizeof(msg), "Verified %lu bytes. %s...",
+           (unsigned long)fwLen, OTA_PAYLOAD_IS_RAW ? "Staging" : "Decompressing");
   setStatus(msg);
   setProgress(0);
 
   int out;
   if (OTA_PAYLOAD_IS_RAW) {
-    out = copyRawToUpdateBin(expected ? expected : (uint32_t)got);
+    out = copyRawToUpdateBin(fwLen);
     if (out < 0) {
       showProgress(false);
       setStatus("Could not stage the image to /fs/UPDATE.BIN.");
@@ -728,11 +916,34 @@ static void runOta(void) {
    failure you cannot afford, because it is also the failure that takes away
    your means of fixing it.
    ------------------------------------------------------------------------- */
-#define WIFI_ATTEMPTS      8
+#define WIFI_ATTEMPTS      12
 #define WIFI_ATTEMPT_MS    10000UL
 #define WIFI_RETRY_MS      30000UL
 
 static unsigned long wifi_lastTry = 0;
+
+/* A RUNNING COUNT, NOT A COUNT WITHIN ONE ROUND.
+ *
+ * Showing "attempt 3 of 12" meant the number restarted at 1 every time the
+ * background retry came round, so a board that had been failing for an hour
+ * looked exactly like one on its first try - the display reset itself
+ * precisely when the information became worth having.
+ *
+ * This lives in the linker's .uninitialized NOLOAD section, which the startup
+ * code does not clear, so it also survives a soft reset - including the one
+ * the OTA itself performs. A real power cycle leaves RAM holding whatever it
+ * holds, which is what the magic word detects: no magic, start at zero.
+ */
+#define WIFI_TRY_MAGIC 0x4F544131UL
+static uint32_t __attribute__((section(".uninitialized"))) wifi_try_magic;
+static uint32_t __attribute__((section(".uninitialized"))) wifi_try_count;
+
+static void wifiCounterInit(void) {
+  if (wifi_try_magic != WIFI_TRY_MAGIC) {
+    wifi_try_magic = WIFI_TRY_MAGIC;
+    wifi_try_count = 0;
+  }
+}
 
 // Waits while keeping LVGL and the dev commands alive, so the screen stays
 // readable and capturable through a slow join.
@@ -763,15 +974,16 @@ static bool tryJoinWiFi(void) {
 
   if (WiFi.status() == WL_CONNECTED) return true;
 
-  int used = 0;
   for (int attempt = 1; attempt <= WIFI_ATTEMPTS; attempt++) {
+    wifi_try_count++;
+
     char msg[64];
-    snprintf(msg, sizeof(msg), "Connecting to WiFi (attempt %d/%d)...",
-             attempt, WIFI_ATTEMPTS);
+    snprintf(msg, sizeof(msg), "Connecting to WiFi (attempt %lu)...",
+             (unsigned long)wifi_try_count);
     setStatus(msg);
 
     Serial.print("[wifi] attempt ");
-    Serial.print(attempt);
+    Serial.print((unsigned long)wifi_try_count);
     Serial.print(": ");
 
     const int rc = WiFi.begin(SSID, PASS);
@@ -783,7 +995,6 @@ static bool tryJoinWiFi(void) {
     // time, tearing down an association that had just come up. A join that
     // works can be undone by the code meant to check it.
     if (rc == WL_CONNECTED || waitForConnect(WIFI_ATTEMPT_MS)) {
-      used = attempt;
       Serial.println("connected");
       break;
     }
@@ -809,22 +1020,9 @@ static bool tryJoinWiFi(void) {
            WiFi.localIP().toString().c_str(), (unsigned long)wifi_ps_mode);
   lv_label_set_text(lbl_ip, ipbuf);
 
-  // SAY WHICH ATTEMPT WORKED. The status line used to show the attempt
-  // currently in progress and was then immediately replaced by "Ready", so
-  // the number that succeeded was never displayed - the last one you could
-  // catch was whichever was in flight when you happened to look, which makes
-  // every join look like it took every attempt. Reporting it after the fact
-  // turns that into a fact instead of an impression.
-  char msg[96];
-  snprintf(msg, sizeof(msg),
-           "Ready (joined on attempt %d of %d). Tap Update to fetch a new image.",
-           used, WIFI_ATTEMPTS);
-  setStatus(msg);
+  setStatus("Ready. Tap Update to fetch a new image.");
 
-  Serial.print("[wifi] joined on attempt ");
-  Serial.print(used);
-  Serial.print(" of ");
-  Serial.println(WIFI_ATTEMPTS);
+  Serial.println("[wifi] joined");
   return true;
 }
 
@@ -839,6 +1037,7 @@ void setup() {
   Serial.println();
   Serial.println("=== Giga_OTA " FW_VERSION " ===");
 
+  wifiCounterInit();
   reportQspiPartitions();
 
   Display.begin();      // calls lv_init() internally

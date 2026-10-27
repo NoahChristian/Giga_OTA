@@ -11,3 +11,6 @@ build/
 
 # Screen captures are a dev artefact, not source
 tools/captures/
+
+# The OTA signing key. Leaking it lets anyone sign firmware for these boards.
+ota_private_key.pem

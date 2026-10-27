@@ -44,9 +44,16 @@ settled by reading.
 
 USAGE
 
-    python mkota.py pack   <in.bin> <out.ota> [--board GIGA] [--no-compress]
-    python mkota.py info   <file.ota>
-    python mkota.py verify <file.ota>
+    python mkota.py sign     <in.bin> <out.bin> [key.pem]
+    python mkota.py checksig <signed.bin> [ota_pubkey.h]
+    python mkota.py pack     <in.bin> <out.ota> [--board GIGA]
+    python mkota.py info     <file.ota>
+    python mkota.py verify   <file.ota>
+
+"sign" is the one you want: it appends an ECDSA P-256 signature trailer that
+the device verifies before staging anything. "checksig" re-checks a signed
+image against the public key the firmware actually carries, which is worth
+doing before you serve it to a board you cannot reach.
 
 "pack" does NOT compress - there is no LZSS encoder here. Use --no-compress
 (the default) and do not call decompress() on the device, or compress the
@@ -178,6 +185,119 @@ def verify(path):
     sys.exit(0 if ok else 1)
 
 
+# ---------------------------------------------------------------------------
+# Signing
+#
+# The signature travels as a TRAILER on the image rather than as a separate
+# file, so there is one URL, one download and no way to end up with an image
+# and a signature that do not belong together:
+#
+#     [ firmware bytes ][ ECDSA signature, DER ][ uint16 siglen ][ 'GSG1' ]
+#
+# The magic goes last so the device can find the trailer by seeking to the
+# end, which it can do without knowing anything about the image first. An
+# unsigned image simply has no magic there, and the device can then decide
+# whether it is willing to accept one.
+#
+# ECDSA P-256 over SHA-256 of the FIRMWARE BYTES ONLY - the trailer is not
+# part of what is signed, or it would have to sign itself.
+# ---------------------------------------------------------------------------
+SIG_MAGIC = b"GSG1"
+TRAILER_FIXED = 6          # uint16 siglen + 4-byte magic
+
+
+def sign(in_path, out_path, key_path):
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+    except ImportError:
+        sys.exit("needs the 'cryptography' package: pip install cryptography")
+
+    if not os.path.isfile(key_path):
+        sys.exit("no private key at %s - run tools/keygen.py first" % key_path)
+
+    firmware = open(in_path, "rb").read()
+    if not firmware:
+        sys.exit("%s is empty" % in_path)
+
+    # Refuse to sign something that is not a firmware image. Signing is a
+    # statement that this is safe to run; making that statement about the
+    # wrong file is the expensive mistake here, because the device will
+    # believe it.
+    sp = struct.unpack("<I", firmware[:4])[0]
+    if not (0x20000000 <= sp <= 0x24100000):
+        sys.exit("REFUSING to sign %s: first word is 0x%08X, which is not a "
+                 "plausible ARM initial stack pointer.\nIs this really a raw "
+                 "sketch binary (not the .with_bootloader one)?" % (in_path, sp))
+
+    key = serialization.load_pem_private_key(open(key_path, "rb").read(),
+                                             password=None)
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        sys.exit("%s is not an EC private key" % key_path)
+
+    sig = key.sign(firmware, ec.ECDSA(hashes.SHA256()))
+
+    out = firmware + sig + struct.pack("<H", len(sig)) + SIG_MAGIC
+    open(out_path, "wb").write(out)
+
+    print("signed %s -> %s" % (in_path, out_path))
+    print("  firmware   %d bytes" % len(firmware))
+    print("  signature  %d bytes (ECDSA P-256 / SHA-256, DER)" % len(sig))
+    print("  total      %d bytes" % len(out))
+
+
+def checksig(path, pub_path):
+    """Verify a signed image the way the device will, before shipping it."""
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        sys.exit("needs the 'cryptography' package: pip install cryptography")
+
+    raw = open(path, "rb").read()
+    if len(raw) < TRAILER_FIXED:
+        sys.exit("%s is too small to carry a signature" % path)
+
+    if raw[-4:] != SIG_MAGIC:
+        sys.exit("FAIL  no signature trailer (magic is %r, expected %r)"
+                 % (raw[-4:], SIG_MAGIC))
+
+    siglen = struct.unpack("<H", raw[-6:-4])[0]
+    fw_len = len(raw) - TRAILER_FIXED - siglen
+    if fw_len <= 0:
+        sys.exit("FAIL  signature length %d does not fit the file" % siglen)
+
+    firmware = raw[:fw_len]
+    sig = raw[fw_len:fw_len + siglen]
+
+    # Parse the public key out of the committed header, so this checks the
+    # key the FIRMWARE will actually use rather than one kept alongside.
+    pem_lines = []
+    for line in open(pub_path, encoding="utf-8"):
+        line = line.strip()
+        if line.startswith('"') and line.endswith('"'):
+            pem_lines.append(line[1:-1].replace("\\n", ""))
+        elif line.startswith('"') and line.endswith('";'):
+            pem_lines.append(line[1:-2].replace("\\n", ""))
+    pem = "\n".join(pem_lines) + "\n"
+    if "BEGIN PUBLIC KEY" not in pem:
+        sys.exit("could not read a public key out of %s" % pub_path)
+
+    pub = serialization.load_pem_public_key(pem.encode("ascii"))
+
+    print("%s" % path)
+    print("  firmware   %d bytes" % fw_len)
+    print("  signature  %d bytes" % siglen)
+    try:
+        pub.verify(sig, firmware, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        print("FAIL  signature does NOT match the key in %s"
+              % os.path.basename(pub_path))
+        sys.exit(1)
+    print("ok    signature verifies against %s" % os.path.basename(pub_path))
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -211,8 +331,25 @@ def main():
     elif cmd == "verify":
         verify(sys.argv[2])
 
+    elif cmd == "sign":
+        if len(sys.argv) < 4:
+            sys.exit("usage: mkota.py sign <in.bin> <out.bin> [key.pem]")
+        key = sys.argv[4] if len(sys.argv) > 4 else os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ota_private_key.pem")
+        sign(sys.argv[2], sys.argv[3], key)
+
+    elif cmd == "checksig":
+        if len(sys.argv) < 3:
+            sys.exit("usage: mkota.py checksig <signed.bin> [ota_pubkey.h]")
+        pub = sys.argv[3] if len(sys.argv) > 3 else os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ota_pubkey.h")
+        checksig(sys.argv[2], pub)
+
     else:
-        sys.exit("unknown command %r; expected pack, info or verify" % cmd)
+        sys.exit("unknown command %r; expected pack, info, verify, sign or "
+                 "checksig" % cmd)
 
 
 if __name__ == "__main__":
