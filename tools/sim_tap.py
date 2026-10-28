@@ -14,7 +14,7 @@ In this repo it is how the Update button gets pressed without hands on the
 board, which makes the whole OTA cycle scriptable.
 
 Usage:
-    python sim_tap.py <x> <y> [COMx]        # COMx e.g. COM3; default COM9
+    python sim_tap.py <x> <y> COMx        # COMx is the board's port, e.g. COM3
 """
 import sys
 import time
@@ -28,12 +28,25 @@ def tap(ser, x, y):
     ser.write(cmd)
 
 
+
+def no_port():
+    """Usage error: the port is required, so say so and show what is attached."""
+    print(__doc__)
+    try:
+        from serial.tools import list_ports
+        found = [p.device for p in list_ports.comports()]
+        print("Ports detected now: " + (", ".join(found) if found
+                                        else "none - is the board plugged in?"))
+    except Exception:
+        pass
+    sys.exit(1)
+
+
 def main():
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(1)
+    if len(sys.argv) < 4:
+        no_port()
     x, y = int(sys.argv[1]), int(sys.argv[2])
-    port = sys.argv[3] if len(sys.argv) > 3 else "COM9"
+    port = sys.argv[3]
 
     ser = serial.Serial(port, 115200, timeout=10)
     tap(ser, x, y)

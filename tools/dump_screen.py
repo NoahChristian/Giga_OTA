@@ -19,7 +19,7 @@ Every capture is written under captures/ with a timestamp in the filename
 there's an audit trail of what was captured and when.
 
 Usage:
-    python dump_screen.py [COMx] [screen_name]        # COMx e.g. COM3; default COM9
+    python dump_screen.py COMx [screen_name]        # COMx is the board's port, e.g. COM3
 """
 import sys
 import struct
@@ -151,8 +151,24 @@ def capture_current_screen(ser, screen_name="manual", clockwise=False, note=""):
     return out_path
 
 
+
+def no_port():
+    """Usage error: the port is required, so say so and show what is attached."""
+    print(__doc__)
+    try:
+        from serial.tools import list_ports
+        found = [p.device for p in list_ports.comports()]
+        print("Ports detected now: " + (", ".join(found) if found
+                                        else "none - is the board plugged in?"))
+    except Exception:
+        pass
+    sys.exit(1)
+
+
 def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else "COM9"
+    if len(sys.argv) < 2:
+        no_port()
+    port = sys.argv[1]
     screen_name = sys.argv[2] if len(sys.argv) > 2 else "manual"
 
     ser = serial.Serial(port, 115200, timeout=10)
