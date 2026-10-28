@@ -14,7 +14,7 @@ In this repo it is how the Update button gets pressed without hands on the
 board, which makes the whole OTA cycle scriptable.
 
 Usage:
-    python sim_tap.py <x> <y> [COM9]
+    python sim_tap.py <x> <y> [COMx]        # COMx e.g. COM3; default COM9
 """
 import sys
 import time

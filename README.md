@@ -17,12 +17,12 @@ A minimal toolset is provided to generate the examples. The examples include a t
 python tools/keygen.py                                     # once, ever
 python tools/mkota.py sign build/Giga_OTA.ino.bin UPDATE.ota
 python tools/serve.py UPDATE.ota                           # prints the URL to paste
-python tools/sim_tap.py 400 330 COM12                      # press Update from the PC
-python tools/dump_screen.py COM12 after                    # read the result back as a PNG
+python tools/sim_tap.py 400 330 COMx                       # press Update from the PC
+python tools/dump_screen.py COMx after                     # read the result back as a PNG
 ```
 
 Needs the `Arduino_Portenta_OTA` library, plus `pyserial` and `cryptography`
-for the tools.
+for the tools. `COMx` is the board's serial port, e.g. `COM3`.
 
 ---
 

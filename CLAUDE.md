@@ -28,7 +28,7 @@ term list. A clone without the file just skips the line.)
 
 ```bash
 arduino-cli compile --fqbn arduino:mbed_giga:giga --build-path <dir> .
-arduino-cli upload  --fqbn arduino:mbed_giga:giga -p <port> --input-dir <dir> .
+arduino-cli upload  --fqbn arduino:mbed_giga:giga -p COMx --input-dir <dir> .
 ```
 
 - **The OTA payload is `Giga_OTA.ino.bin`, NOT `Giga_OTA.ino.with_bootloader.bin`.**
@@ -59,7 +59,7 @@ arduino-cli upload  --fqbn arduino:mbed_giga:giga -p <port> --input-dir <dir> .
 
 ## Testing it properly
 
-- `sim_tap.py 400 330 <port>` presses Update. Coordinates are **logical**
+- `sim_tap.py 400 330 COMx` presses Update. Coordinates are **logical**
   800x480; `simTouchReadCb()` does the rotation inversion.
 - **Wait for the join before tapping.** `serviceDevCommands()` runs during the
   connect retry loop, so a tap sent too early queues and then fails with a

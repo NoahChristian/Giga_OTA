@@ -19,7 +19,7 @@ Every capture is written under captures/ with a timestamp in the filename
 there's an audit trail of what was captured and when.
 
 Usage:
-    python dump_screen.py [COM9] [screen_name]
+    python dump_screen.py [COMx] [screen_name]        # COMx e.g. COM3; default COM9
 """
 import sys
 import struct
