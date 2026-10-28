@@ -10,10 +10,14 @@ term list. A clone without the file just skips the line.)
 
 ## Publishing rules - these are hard
 
-- **Private repo. Keep it generic.** This reads as "how to do OTA on a GIGA
-  R1 with an LVGL UI", written by someone with one spare board. No references
-  to any other project, what any board controls, where anything is installed,
-  no SSIDs, no real IPs, no MQTT topics.
+- **Keep it self-contained.** The repo exists so that someone who wants GIGA
+  OTA gets exactly that, with nothing to disentangle from a larger project.
+  Every reference to another repo is something the reader has to go and
+  understand first, which is the cost this split was meant to avoid. That is
+  the reason; the privacy rules below stand on their own.
+- **No SSIDs, no real IPs, no MACs, no MQTT topics** - in text *or* in
+  screenshots. A grep cannot read a PNG, so images are checked by eye before
+  they are committed.
 - **Before every commit**, sweep for leaks. A real LAN address slipped into a
   README log excerpt once and had to be scrubbed after pushing. The sweep is a
   `grep` over `*.md`, `*.ino`, `*.py` and `*.h`; **the term list lives in
