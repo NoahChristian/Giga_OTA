@@ -1,293 +1,220 @@
 # Giga_OTA
 
-A minimal over-the-air firmware update on an **Arduino GIGA R1 WiFi**, with an
-LVGL screen so the result is visible rather than inferred.
+## The Problem
+Many of the Arduino and ESP32 devices directly support over-the-air (OTA) firmware updates; the Giga does not.
 
-The whole demonstration is one number. Flash the sketch once over USB, push a
-new build over the air, and watch the version label on the display change. No
-counters, no log scraping, no "it probably worked".
+## The Solution
 
+A minimal demonstration of OTA firmware updates on an **Arduino GIGA R1 WiFi**. This uses a Giga Display Shield to provide user feedback as a minimal example, using LVGL. This uses asymmetric key cryptography to validate firmware image authenticity prior to reflash. Only the public key is stored on the device, so the key cannot be reverse engineered.
+
+A minimal toolset is provided to generate the examples. The examples include a technique for screen capture of the shield so that the user, AI, or future user can see the sample displays and for documentation.
+
+| before                         | after                          |
+| ------------------------------ | ------------------------------ |
+| ![before](docs/before_ota.png) | ![after](docs/ota_success.png) |
+
+```bash
+python tools/keygen.py                                     # once, ever
+python tools/mkota.py sign build/Giga_OTA.ino.bin UPDATE.ota
+python tools/serve.py UPDATE.ota                           # prints the URL to paste
+python tools/sim_tap.py 400 330 COM12                      # press Update from the PC
+python tools/dump_screen.py COM12 after                    # read the result back as a PNG
 ```
-+--------------------------------------------+
-|        GIGA R1 over-the-air update         |
-|                                            |
-|                 FW 1.0.0                   |
-|         WiFi: 10.0.0.42   PS mode 0        |
-|      QSPI: 4 partitions, OTA 5120 kB       |
-|                                            |
-|                [ Update ]                  |
-|                                            |
-|   Ready. Tap Update to fetch a new image.  |
-+--------------------------------------------+
-```
 
-Status: **working.** Signed updates proven end to end on hardware. See [Where this has got to](#where-this-has-got-to).
+Needs the `Arduino_Portenta_OTA` library, plus `pyserial` and `cryptography`
+for the tools.
 
 ---
 
-## Why this repo exists
+## Background
 
-Searching for GIGA R1 OTA turns up a stale forum answer saying the GIGA is not
-supported, a tutorial written for the Portenta H7, and a packaging toolchain
-that does not run on Windows. All three are misleading, and working out why
-took a day. This repo is the write-up, with a working sketch attached.
+Searching for GIGA R1 OTA turns up a stale forum answer saying the GIGA is
+unsupported, a tutorial written for the Portenta H7, and a packaging toolchain
+that does not run on Windows. All three are misleading:
 
-The three things worth knowing up front:
-
-1. **The GIGA is supported.** First-class, not by accident.
-2. **The bootloader already on your board can do OTA.** Nothing to replace.
-3. **The documented packaging tools do not run on Windows**, and you probably
-   do not need them anyway.
+1. **The onboard bootloader already does OTA.** (see 1)
+2. **The GIGA is supported** (see 2)
+3. **You can skip the documented packaging tools entirely.** (see 3)
 
 ---
 
 ## 1. The bootloader already supports OTA
 
-This is the question that decides whether any of this is possible, and you can
-answer it without running anything. The bootloader shipped with the core
-(`packages/arduino/hardware/mbed_giga/<ver>/bootloaders/GIGA/bootloader.elf`)
-contains `getOTABinaryBase()`, a full FATFS, `QSPIFBlockDevice` and
-`FlashIAPBlockDevice`. Its own log strings describe the entire mechanism:
+The bootloader shipped with the core (`bootloaders/GIGA/bootloader.elf`) contains `getOTABinaryBase()`, a full FATFS and `QSPIFBlockDevice`, and its own strings describe the mechanism:
 
 ```
-I-Start OTA 0x%X 0x%X 0x%X
-I-Default OTA data  /  I-Custom OTA data
-I-Sketch updated
-I-Booting sketch at 0x%x
-E-Failed to locate firmware image, error: %d
+I-Start OTA 0x%X 0x%X 0x%X        I-Sketch updated
+I-Booting sketch at 0x%x          E-Failed to locate firmware image, error: %d
 /fs/UPDATE.BIN   /fs/UPDATE.BIN.LZSS   /fs/scratch.bin
 ```
 
-So the sequence is: something puts a file at `/fs/UPDATE.BIN` on the QSPI
-flash, something records that an update is pending, and on the next boot the
-bootloader applies it and prints `I-Sketch updated`.
+Something puts a file at `/fs/UPDATE.BIN`, something records that an update is
+pending, and the bootloader applies it on the next boot.
 
-That last string is the only trustworthy confirmation an update happened.
-`ota.update()` returning `Error::None` means the update was *recorded*, not
-that it was *applied*.
+**`I-Sketch updated` is the only trustworthy confirmation.** `ota.update()`
+returning `Error::None` means the update was *recorded*, not *applied*.
 
-### Memory map
+### Quad Serial Peripheral Interface (QSPI) flash layout
 
-From the DFU descriptors in that same binary:
+`/fs/UPDATE.BIN` lives on a FAT filesystem on the Master Boot Record (**MBR partition 2**), in the layout that the core's `QSPIFormat` example creates:
 
-| Region | Address | Size |
-|---|---|---|
-| Bootloader | `0x08000000` | 256 KB |
-| Sketch | `0x08040000` | rest of 2 MB internal flash |
-| QSPI, filesystem view | `0xA0000000` | 16 MB |
-| QSPI, raw view | `0x90000000` | 16 MB |
+| Partition | Purpose                        | Size | Mount    |
+| --------- | ------------------------------ | ---- | -------- |
+| 1         | WiFi firmware and certificates | 1 MB | `wlan`   |
+| 2         | **OTA**                        | 5 MB | **`fs`** |
+| 3         | Provisioning KVStore           | 1 MB | -        |
+| 4         | User data                      | 7 MB | `user`   |
 
-### QSPI partitions
+If the QSPI has never been partitioned, OTA cannot work and the failure is
+opaque - so this sketch reads the partition table at boot and puts the answer
+on screen. If it says unpartitioned, run `QSPIFormat` once. **That erases the
+QSPI**, including stored WiFi credentials in partition 3.
 
-`/fs/UPDATE.BIN` lives on a FAT filesystem on **MBR partition 2**. The layout
-the bootloader expects is the one the core's own `QSPIFormat` example creates:
-
-| Partition | Purpose | Size | Mount |
-|---|---|---|---|
-| 1 | WiFi firmware and certificates (`cacert.pem`) | 1 MB | `wlan` |
-| 2 | **OTA** | 5 MB | **`fs`** |
-| 3 | Provisioning KVStore | 1 MB | — |
-| 4 | User data | 7 MB | `user` |
-
-**If the QSPI has never been partitioned, OTA cannot work**, and the failure is
-opaque. This sketch reads the partition table at boot and puts the answer on
-the screen so you are not guessing. If it says the flash is not partitioned,
-run `File > Examples > STM32H747_System > QSPIFormat` once.
-
-> **The LBA fields are not in 512-byte sectors.** If you read the MBR
-> yourself — and you should, since "is the OTA partition big enough for my
-> image" is the whole point — note that `MBRBlockDevice::partition()` takes
-> byte addresses (`bd_addr_t`) and stores them divided by
-> `max(erase_size, 512)`, which is **4096** on this QSPI. Assume the usual 512
-> and every partition reads 8x too small: the 5 MB OTA partition shows up as
-> 640 kB, which looks exactly like a board that needs reformatting. Use
-> `bd->get_erase_size()` rather than a constant.
->
-> A quick sanity check if you are unsure: the four partitions should come out
-> in a 1:5:1:7 ratio whatever unit you divide by. If the ratio is right and
-> the absolute numbers look small, it is the unit, not the flash.
-
-> **That format erases the QSPI**, including stored WiFi credentials in
-> partition 3 and anything in partition 4. On a board in service, know what is
-> on there before you run it.
+>Note -  **The MBR's LBA fields are not in 512-byte sectors.**
+> `MBRBlockDevice::partition()` takes byte addresses and stores them divided by
+> `max(erase_size, 512)` - **4096** here. Assume 512 and every partition reads
+> 8x too small, so the 5 MB OTA partition shows up as 640 kB and looks exactly
+> like a board needing a reformat. Use `bd->get_erase_size()`. Sanity check:
+> the four partitions should be in a 1:5:1:7 ratio whatever unit you divide
+> by - if the ratio is right and the numbers look small, it is the unit.
 
 ---
 
-## 2. The GIGA is a supported target
+## 2. The GIGA *is* supported
 
-The library to use is **`Arduino_Portenta_OTA`** (Library Manager, 1.2.1 at the
-time of writing). Its name says Portenta and its README only discusses the H7,
-which is why people conclude the GIGA is unsupported. It is not:
+Use **`Arduino_Portenta_OTA`**. Its name says Portenta and its README only
+discusses the H7, which is why people conclude the GIGA is unsupported:
 
-- `library.properties` lists `mbed_giga` among its architectures.
-- Its own `examples/OTA_Qspi_Flash/OTA_Qspi_Flash.ino` has an
-  `#elif defined(ARDUINO_GIGA)` arm pointing at a prebuilt GIGA image.
-- Arduino publish that image at
-  `https://downloads.arduino.cc/ota/OTA_Usage_Portenta.ino.GIGA.ota`.
-- `bin2ota.py` lists `GIGA` with its own magic number, `0x23410266`.
+- `library.properties` lists `mbed_giga`.
+- `examples/OTA_Qspi_Flash` has an `#elif defined(ARDUINO_GIGA)` arm.
+- `bin2ota.py` lists `GIGA`, magic `0x23410266`.
+- Arduino publish a prebuilt image at
+  `downloads.arduino.cc/ota/OTA_Usage_Portenta.ino.GIGA.ota` - useful for
+  proving the mechanism before you have built anything yourself.
 
-The prebuilt image is genuinely useful: it lets you prove the mechanism works
-on your board before you have built anything yourself, which separates "is OTA
-possible here" from "is my image correct".
+The API is six calls: `isOtaCapable()`, `begin()`, `download()`,
+`decompress()`, `update()`, `reset()`. `isOtaCapable()` false means the
+bootloader is older than the library wants - update it via
+`Examples > STM32H747_System > STM32H747_manageBootloader`.
 
-### The API
+**`download()` has no progress callback** and blocks for the better part of a
+minute. This sketch drives the HTTP GET itself instead, because `send()`
+returns once headers are parsed and the body streams through a callback - so
+it owns the wait loop and can pump LVGL, count bytes, and read
+`Content-Length` for a real denominator.
 
-Six calls, in this order:
-
-```cpp
-Arduino_Portenta_OTA_QSPI ota(QSPI_FLASH_FATFS_MBR, 2);   // partition 2
-
-ota.isOtaCapable();   // bootloader new enough?
-ota.begin();          // mount the OTA filesystem
-ota.download(url, is_https);   // -> /fs/UPDATE.BIN.LZSS
-ota.decompress();              // -> /fs/UPDATE.BIN
-ota.update();                  // record it for the bootloader
-ota.reset();                   // reboot; the bootloader applies it
-```
-
-`isOtaCapable()` returning false means the bootloader is older than the library
-wants. Update it with
-`File > Examples > STM32H747_System > STM32H747_manageBootloader`.
-
-**There is no progress callback.** `download()` blocks until it finishes and
-reports only a byte count. A progress bar on this API would either never move
-or be a fiction, so this sketch shows stage transitions and a final byte count
-instead. If you want real progress, `downloadAndDecompress()` tracks it
-internally — but it does not surface it either, so you would be modifying the
-library.
+![progress](docs/progress.png)
 
 ---
 
-## 3. The packaging problem, and why you can probably skip it
+## 3. Skip the packaging tools
 
-The documented way to build an image is Arduino's `lzss.py` and `bin2ota.py`
-from `ArduinoIoTCloud/extras/tools`:
+The documented path is Arduino's `lzss.py` + `bin2ota.py`. `lzss.py` is a
+ctypes shim that loads `./lzss.so`; **there is no `lzss.dll`**, so on Windows
+it simply does not run.
 
-```bash
-./lzss.py --encode SKETCH.bin SKETCH.lzss
-./bin2ota.py GIGA SKETCH.lzss SKETCH.ota
-```
-
-`lzss.py` is a ctypes shim:
-
-```python
-LZSS_SO_EXT = "so" if platform.uname()[0] != "Darwin" else "dylib"
-lzss_functions = ctypes.CDLL(f"./lzss.{LZSS_SO_EXT}")
-```
-
-There is no `lzss.dll`. **On Windows the documented path does not run**, and
-building the `.so` from `lzss.c` needs a host C compiler you may not have.
-
-### What the container actually is
-
-20 bytes of header, then the payload (`src/decompress/utility.cpp`):
-
-```c
-uint32_t len;            // bytes of magic + version + payload
-uint32_t crc32;          // over magic + version + payload
-uint32_t magic_number;   // 0x23410266 for the GIGA
-uint64_t version;        // bitfield: header_version:6, compression:1,
-                         // signature:1, spare:4, payload_target:4,
-                         // payload_major:8, payload_minor:8,
-                         // payload_patch:8, payload_build_num:24
-```
-
-`tools/mkota.py` in this repo builds and inspects that container in pure
-Python — `zlib.crc32`, no ctypes, no native library, no `crccheck` dependency.
-It runs anywhere Python does.
-
-### The compression flag is not what it looks like
-
-`bin2ota.py` writes its version field as `bytearray([0]*7 + [0x40])` with the
-comment *"all 0 except the compression flag set"*. But `compression` is bit 6
-of the first 32-bit word, which little-endian puts in **byte 0**, not byte 7.
-Byte 7 lands inside `payload_build_num`.
-
-You can check this against Arduino's own shipped artifact:
+Arduino's own shipped GIGA `.ota` is LZSS-compressed, yet
+its compression flag - bit 6 of the first word, per the library's own bitfield
+in `src/decompress/utility.cpp` - reads **0**:
 
 ```
 $ python tools/mkota.py info OTA_Usage_Portenta.ino.GIGA.ota
-  len field   86894  (body is 86894)
-  crc32       0x7B783DB8
   magic       0x23410266  GIGA
   version     00 00 00 00 00 00 00 40
-  decoded     header_version=0 compression=0 signature=0 target=0  v0.0.0 build 4194304
+  decoded     compression=0 ...
 ```
 
-That file **is** LZSS-compressed, and the compression bit as the struct defines
-it reads **0**. So the device cannot be consulting that bit — `decompress()`
-decompresses unconditionally, and the flag is decorative.
+(`bin2ota.py` writes its flag into byte 7; the struct puts that bit in byte 0.)
+The device cannot be reading it, so `decompress()` is unconditional and the
+container carries nothing the device needs. **Serve the plain `.bin` and never
+call `decompress()`** - the bootloader only cares that `/fs/UPDATE.BIN` is a
+valid image.
 
-**Which means the simplest thing works:** if you do not compress, do not call
-`decompress()`. The payload goes to `/fs/UPDATE.BIN.LZSS` and simply needs to
-end up at `/fs/UPDATE.BIN`. There is corroboration for the bootloader being
-relaxed about this — Arduino's *Zephyr* core ships an OTA library whose README
-says its images carry no OTA header at all, because "the mbed bootloader
-validates the file by checking that the first word is a valid ARM initial stack
-pointer; an OTA header would fail that check."
-
-`mkota.py` warns if the first word of your `.bin` is not a plausible stack
-pointer, which catches the commonest mistake — packaging the wrong file.
+`tools/mkota.py` builds and inspects `.ota` containers in pure Python if you
+want one anyway.
 
 ---
 
-## 4. Verifying it from the PC, not by eye
+## 4. Signing Images
 
-An update mechanism you have to walk over and look at is only half useful. Two
-serial commands make the whole cycle scriptable:
+ECDSA P-256 over SHA-256 is verified on the device **before anything is staged**.
+The board holds only the public key, so reading a board's flash gives no way to
+sign for it.
 
-| Command | Does | PC-side tool |
-|---|---|---|
-| `D` | Dumps the raw RGB565 framebuffer | `tools/dump_screen.py` → a real PNG |
-| `P` + `xxxyyy` | Injects a tap at that logical point | `tools/sim_tap.py` |
+That property makes the transport somewhat irrelevant. HTTP or HTTPS, a hostile
+server, DNS you do not control: an image not signed by the matching private key
+is rejected before `/fs/UPDATE.BIN` is touched.
 
-```bash
-python tools/sim_tap.py 400 330        # press Update
-# ... board downloads, reboots ...
-python tools/dump_screen.py COM12 after_update
-# captures/after_update_<timestamp>.png now shows FW 1.0.1
+![rejected](docs/rejected_unsigned.png)
+
+`keygen.py` writes `ota_private_key.pem` (**secret, gitignored, back it up**)
+and `ota_pubkey.h` (public, committed, compiled in). Flash the board over USB
+once so it carries the key, then sign every image. `mkota.py checksig`
+re-verifies using the key parsed out of that header - the one the firmware
+actually carries.
+
+The signature is a trailer, so there is one URL and no way to pair an image
+with the wrong signature:
+
+```
+[ firmware bytes ][ ECDSA signature, DER ][ uint16 siglen ][ GSG1 magic ]
 ```
 
-`dump_screen.py` needs only `pyserial` and `zlib` — no Pillow. It un-rotates
-the framebuffer on the PC side, because the Display Shield's panel is
-physically portrait: declaring `Display(800, 480)` makes the library create a
-480x800 LVGL display with `ROTATION_270`, so the raw framebuffer comes back
-portrait-native.
+Magic last, so the device finds it by seeking to the end. The signature covers
+the firmware only, and the verified length tells staging where to stop - the
+bootloader never sees the trailer. Costs ~48 kB of flash.
 
-`sim_tap.py` drives a **second LVGL pointer indev**, so a simulated tap goes
-through real hit-testing and click bubbling — the same path a finger takes,
-not a shortcut that calls the callback directly.
+**Rotating the key means USB-flashing every board**, since a board only accepts
+images signed by the key it already carries. That is the property doing the
+work.
 
-> **The one trap.** LVGL applies `lv_display_rotate_point()` to every indev
-> read. The real touch controller reports raw panel coordinates, so it works
-> for free. Feeding *logical* coordinates to your own indev makes LVGL rotate
-> them a second time and taps land nowhere. `simTouchReadCb()` inverts
-> `ROTATION_270` by hand (`raw_x = 479 - logical_y`, `raw_y = logical_x`) so
-> the serial protocol stays in the logical 800x480 space everything else uses.
+### What signing does not give you
+
+- **No rollback protection.** An older, legitimately signed image can be
+  replayed. Signed-and-versioned is stronger than signed; this does the first
+  half.
+- **No confidentiality** over HTTP. HTTPS adds ~148 kB for the TLS stack.
+- **The Content-Length and stall-timeout checks are not security.** They
+  protect against dropped connections and crashed servers; an attacker serves
+  a complete, correct-length image.
+- **`OTA_REQUIRE_SIGNATURE` can be turned off.** It exists for bringing up a
+  board before you have a key. Shipping with it off means anyone who can
+  answer the URL owns the device.
+
+ **The trigger is local.** An update only starts when the unit commands it. This is somewhat by architecture in where it must be initiated. You can, for example send an MQTT or Red packet to initiate an update, but with a larger security surface to consider.
+
+For signed, verified, rollback-aware updates below the application, the
+bootloader already contains a complete MCUboot (`MCUBoot_ECIES_v1`,
+`I-Swap type`, `E-Image in the %s slot is not valid!`). Much larger job.
 
 ---
 
-## 5. The WiFi radio sleeps, and the Arduino API cannot stop it
+## 5. Failing safely
 
-Not strictly an OTA topic, but it will bite you during a multi-hundred-kilobyte
-download, so the fix is in the sketch.
+A failed update must leave a working board. `tools/serve_broken.py` declares
+the full `Content-Length` then either closes halfway (`truncate`) or holds the
+socket open sending nothing (`stall`).
 
-`whd_wifi_on()` in the core enables PM2 powersave unconditionally on every
-radio power-up. From the shipped `libmbed.a` (`whd_management.o`):
+![recovery](docs/recovery.png)
 
-```
-bl    whd_wifi_set_up
-movs  r1, #200                                 ; return_to_sleep_delay
-bl    whd_wifi_enable_powersave_with_throughput
-```
+Two guards:
 
-After that the radio wakes only on DTIM beacons. Outbound traffic is
-unaffected — which is why a board that publishes happily can still be hard to
-reach, and why this is easy to misdiagnose as a router problem.
+- **A stall timeout**
+- **Refusal to stage anything shorter than `Content-Length`**
+---
 
-`mbed_giga`'s `WiFi` class exposes no setting for it; there is no
-`WiFi.setSleep()` the way there is on the ESP32 core. But `WiFi.h` already
-pulls in `whd_wifi_api.h`, so the WHD calls link straight from a sketch:
+## 6. Gotcha - WiFi sleeps and the Arduino API can't change it on the Giga
+
+Not an OTA topic, but it will spoil a large download.
+
+`whd_wifi_on()` enables PM2 powersave unconditionally on every radio power-up
+(`movs r1, #200` then `bl whd_wifi_enable_powersave_with_throughput` in the
+shipped `libmbed.a`). After that the radio wakes only on DTIM beacons.
+Outbound traffic is unaffected, which is why a board that publishes happily
+can still be hard to reach - easy to misdiagnose as a router problem.
+
+There is no `WiFi.setSleep()` on `mbed_giga`, but `WiFi.h` already pulls in
+`whd_wifi_api.h`:
 
 ```cpp
 extern "C" { whd_driver_t cybsp_get_wifi_driver(void); }
@@ -297,276 +224,58 @@ whd_wifi_disable_powersave(ifp);
 whd_wifi_get_powersave_mode(ifp, &mode);   // read it back: 0 = off
 ```
 
-Call it **after** the join — `whd_wifi_on()` re-arms PM2 every time the radio
-is powered up, so anything that cycles the radio undoes it. If your sketch
-disconnects to scan, re-apply it on every reconnect, not once at boot.
-
-The read-back matters. `whd_wifi_get_powersave_mode()` makes the chip state its
-own mode (`2` → `0`), which is a fact rather than a hope. Do not try to confirm
-this with ping times — a busy main loop delays low-priority ICMP replies badly
-enough to drown the signal you are looking for.
+Call it **after** the join, and re-apply on every reconnect - `whd_wifi_on()`
+re-arms PM2 each time the radio comes up. Read the mode back rather than
+trusting the call; do not try to confirm it with ping times.
 
 ---
 
-## 6. What about Zephyr?
+## 7. What about Zephyr?
 
-The mbed cores are end-of-life, and `ArduinoCore-zephyr` 1.0.0 lists the GIGA
-R1 WiFi among its supported boards. So should you wait?
+The mbed cores are end-of-life and `ArduinoCore-zephyr` 1.0.0 lists the GIGA
+R1. **Not yet, if you need a screen** - that core ships no display library and
+no LVGL. The only trace of the Display Shield is a devicetree binding for its
+DSI bridge (`analogix,anx7625.yaml`); nothing drives it from a sketch.
 
-**Not if you need a screen.** That core ships no display library and no LVGL —
-its whole library set is `Arduino_LED_Matrix`, `CAN`, `Camera`, `Ethernet`,
-`OTA`, `PDM`, `RTC`, `SPI`, `SocketWrapper`, `Storage`, `WiFi`, `Wire`,
-`Zephyr_SDRAM`, `ea_malloc`, `stubs`. There is no `Arduino_H7_Video`, no
-`Arduino_GigaDisplayTouch`. The only trace of the Display Shield is a
-devicetree binding for its DSI bridge, `analogix,anx7625.yaml` — the chip is
-described, but nothing drives it from a sketch.
-
-**Most of this transfers anyway.** Zephyr's own OTA library writes to the OTA
-partition on QSPI and lets *the mbed bootloader* apply it; it requires running
-a `FlashFormat` that creates "the MBR partition table and FAT filesystems on
-QSPI that both the Zephyr loader and the mbed bootloader depend on", and it
-serves the image over plain HTTP. Same bootloader, same partitions, same
-hosting. What changes is the sketch-side API and the image format.
-
-**And the bootloader is ready for whatever comes after.** Alongside the Arduino
-OTA path it carries a complete MCUboot — slot swap, image validation,
-encrypted images:
-
-```
-I-Starting MCUboot
-I-Image upgrade secondary slot -> primary slot
-I-Swap type: %s
-MCUBoot_ECIES_v1
-```
-
-`@Arduino boot v.%02d` and `@MCUboot v.%02d` both appear as DFU alt-settings,
-so the board can run either bootloader personality. The hardware will not be
-what blocks you.
+Most of this transfers: Zephyr's own OTA library writes to the same
+QSPI OTA partition and lets *the mbed bootloader* apply it, over plain HTTP.
+Same bootloader, same partitions, same hosting. The sketch-side API and the image format change.
 
 ---
 
-## Security: images are signed, and that is the only reason this is safe
+## Bonus - Verifying from the PC - Screen Grabbing and Interface Automation
 
-**Images are signed with ECDSA P-256 and verified on the device before
-anything is staged.** The board carries only the public key, so reading a
-board's flash - which anyone with the USB port can do - gives an attacker no
-way to sign anything for it.
+| Command        | Does                  | Tool                                 |
+| -------------- | --------------------- | ------------------------------------ |
+| `D`            | Dumps the framebuffer | `dump_screen.py`, which writes a PNG |
+| `P` + `xxxyyy` | Injects a tap         | `sim_tap.py`                         |
 
-That single property is what makes the transport irrelevant. HTTP or HTTPS, a
-hostile server, a hostile router, DNS you do not control: an image that is not
-signed by the matching private key is rejected before `/fs/UPDATE.BIN` is
-touched.
+`dump_screen.py` needs only `pyserial` and `zlib` - no Pillow. It un-rotates
+the framebuffer, because the panel is physically portrait: `Display(800, 480)`
+creates a 480x800 LVGL display with `ROTATION_270`.
 
-```
-REJECTED: image is not signed. Nothing was changed.
-```
+`sim_tap.py` drives a second LVGL pointer indev, so a tap goes through real
+hit-testing and click bubbling.
 
-### Setting it up
-
-```bash
-python tools/keygen.py          # once, ever
-```
-
-That writes `ota_private_key.pem` (**secret, gitignored, back it up**) and
-`ota_pubkey.h` (public, committed, compiled into the firmware). Then flash the
-board over USB once so it carries the key, and sign every image after that:
-
-```bash
-python tools/mkota.py sign     build/Giga_OTA.ino.bin UPDATE.ota
-python tools/mkota.py checksig UPDATE.ota        # verifies against ota_pubkey.h
-python tools/serve.py          UPDATE.ota
-```
-
-`checksig` re-verifies using the public key parsed out of the committed
-header - the key the firmware actually carries - which is worth doing before
-serving anything to a board you cannot reach.
-
-### How it travels
-
-The signature is a trailer rather than a second file, so there is one URL, one
-download, and no way to pair an image with the wrong signature:
-
-```
-[ firmware bytes ][ ECDSA signature, DER ][ uint16 siglen ][ 'GSG1' ]
-```
-
-Magic last, so the device finds the trailer by seeking to the end without
-needing to understand the image first. The signature covers the firmware bytes
-only - a trailer cannot sign itself - and the verified firmware length is
-exactly what tells the staging step where to stop, so the bootloader never
-sees the trailer.
-
-Verification is a streaming SHA-256 over the downloaded file (590 KB will not
-fit in RAM and does not need to), then `mbedtls_pk_verify()` against the
-embedded key. mbedTLS is already compiled into the core; the whole feature
-costs about 48 kB of flash.
-
-**Rotating the key means USB-flashing every board**, because a board only
-accepts images signed by the key it already carries. That is the property
-doing the work, and it is also why `keygen.py` refuses to overwrite an
-existing key without `--force`.
-
-### What this still does not give you
-
-- **No rollback protection.** Nothing stops an attacker replaying an *older,
-  legitimately signed* image with a known defect. Signed-and-versioned is a
-  stronger requirement than signed, and this only does the first half.
-- **No confidentiality.** Over HTTP the firmware is readable in flight. If the
-  image itself is sensitive, you want HTTPS as well - note that enabling it
-  costs about 148 kB, because the TLS stack is otherwise
-  dead-code-eliminated.
-- **The accident guards are not security measures.** The Content-Length check
-  and the stall timeout protect against dropped connections and crashed
-  servers. An attacker simply serves a complete, correct-length image - it is
-  the signature that stops them, nothing else.
-- **`OTA_REQUIRE_SIGNATURE` can be turned off.** It is `true` by default and
-  exists for bringing up a board before you have a key. Shipping with it off
-  gives you the first draft of this README, where anyone who can answer the
-  URL owns the device.
-
-### If you want the stronger version
-
-The bootloader already on the board contains a complete MCUboot with image
-validation, slot swap and encrypted-image support - the strings
-`MCUBoot_ECIES_v1`, `I-Swap type` and `E-Image in the %s slot is not valid!`
-are all in it. That is the supported route to signed, verified, rollback-aware
-updates with the verification below the application rather than inside it, and
-it is a much larger piece of work than this repo.
+> **The trap:** LVGL applies `lv_display_rotate_point()` to every indev read.
+> The real touch controller reports *raw* panel coordinates. Feeding *logical* coordinates to your own indev rotates them twice and
+> taps land nowhere. `simTouchReadCb()` inverts `ROTATION_270` by hand
+> (`raw_x = 479 - logical_y`, `raw_y = logical_x`).
 
 ---
 
-<details>
-<summary>What this looked like before signing, and why it was not acceptable</summary>
+## Status and Potential to-do's
 
-The first working version fetched over plain HTTP and ran whatever came back.
-Anyone who could answer that URL owned the board: ARP or DNS spoofing on the
-same network, anything on the path, or the host itself. Arbitrary code
-execution, persistent, with the version number under the attacker's control
-too.
-
-What did not help, and still does not:
-
-- **The `.ota` CRC32 is a checksum, not a MAC.** It detects corruption and is
-  trivial to recompute for modified content. It stops bit-rot, not people.
-- **The bootloader's image check is a sanity check.** It verifies the first
-  word looks like a plausible ARM initial stack pointer. Any real firmware
-  image passes, including the attacker's.
-- **HTTPS alone would not have been enough.** It stops the path attacks, but
-  you are still trusting whoever controls the host and the certificate chain.
-  It says the bytes arrived unmodified from *somewhere*, not that they are
-  *your* firmware.
-
-One thing that did help, and still does: **the trigger is local.** An update
-only starts when someone presses the button on the device, so an attacker
-cannot initiate one remotely - they have to be positioned at the moment you
-choose to update. Think carefully before adding a remote trigger.
-
-</details>
-
----
-
-## Getting started
-
-```
-Giga_OTA.ino               the sketch: LVGL UI + OTA, one file
-arduino_secrets.h.example  copy to arduino_secrets.h and fill in
-tools/serve.py             static HTTP server; prints the URL to paste
-tools/mkota.py             build/inspect .ota containers, pure Python
-tools/dump_screen.py       pull a PNG of the screen over serial
-tools/sim_tap.py           press a button from the PC
-```
-
-Requires the `Arduino_Portenta_OTA` library, and `pyserial` for the two serial
-tools.
-
-1. Copy `arduino_secrets.h.example` to `arduino_secrets.h`; fill in SSID,
-   password and the update URL.
-2. Build and flash over USB. Check the QSPI line on screen; run `QSPIFormat`
-   if it says the flash is not partitioned.
-3. Prove the mechanism with Arduino's prebuilt image before your own:
-   ```bash
-   curl -LO https://downloads.arduino.cc/ota/OTA_Usage_Portenta.ino.GIGA.ota
-   python tools/serve.py OTA_Usage_Portenta.ino.GIGA.ota
-   ```
-   Tap Update. Success is `I-Sketch updated` on the console and Arduino's demo
-   sketch running. Re-flash this sketch over USB afterwards.
-4. Then your own: bump `FW_VERSION`, build, and serve the `.bin`.
-
----
-
-## Where this has got to
-
-Honest status, because a repo that overstates itself is worse than no repo.
-
-- [x] Bootloader OTA support confirmed by inspection
-- [x] QSPI partition scheme identified
-- [x] GIGA confirmed as a supported library target
-- [x] `.ota` container format decoded
-- [x] `mkota.py` validated against Arduino's official GIGA image
-- [x] Compression flag behaviour determined from that image
-- [x] Sketch builds, runs, and renders; screen capture over serial working
-- [x] QSPI confirmed partitioned on a real board - 4 partitions, OTA
-      partition 2 is 5120 kB, so no reformat needed
+- [x] Bootloader OTA support, QSPI layout, GIGA as a library target
+- [x] `.ota` container decoded; `mkota.py` validated against Arduino's own image
+- [x] OTA proven end to end with a self-built image, plain `.bin`, no container
+- [x] Signed images verified on-device - unsigned rejected and signed accepted
+      in the same boot
+- [x] Recovery from an interrupted download, and updatable afterwards
 - [x] WHD powersave disable confirmed `2 -> 0`
-- [x] **OTA proven end to end on hardware with a self-built image**, served
-      as a plain `.bin` over local HTTP, with no LZSS and no `.ota` container
-- [ ] OTA proven with a real LZSS `.ota` (the documented path; untested here
-      because the raw path removed the need for it)
-- [ ] HTTPS path proven
-- [x] **Recovery from an interrupted download proven on hardware** - the
-      board refused a half-image, stayed on its existing firmware, remained
-      usable, and took the next legitimate update normally
-- [x] **Signed images, verified on the device** - an unsigned image is
-      rejected and a signed one accepted, proven in the same boot
-- [ ] Rollback protection (an old signed image can still be replayed)
+- [ ] Rollback protection - currently, older valid firmware images can be installed
+- [ ] HTTPS path
 
-### The run that proved it
+## License
 
-A board running 1.0.0 was pointed at a 739,280-byte `.bin` of 1.0.1 and told
-to update itself. Everything below was driven from the PC - the button press
-included - and both images are straight out of `dump_screen.py`:
-
-| before | after |
-|---|---|
-| ![before](docs/before_ota.png) | ![after](docs/ota_success.png) |
-
-```
-$ python tools/serve.py build/Giga_OTA.ino.bin
-$ python tools/sim_tap.py 400 330 COM12      # press Update
-  192.168.1.42 - "GET /UPDATE.ota HTTP/1.1" 200 -
-$ python tools/dump_screen.py COM12 after    # FW 1.0.1
-```
-
-Progress is real, not a spinner - `Content-Length` gives the denominator:
-
-![progress](docs/progress.png)
-
-### Failing safely
-
-`tools/serve_broken.py` serves a deliberately bad update so you can watch a
-failure before you need to survive one. It declares the full `Content-Length`
-and then either closes halfway (`truncate`) or holds the socket open sending
-nothing (`stall`).
-
-![recovery](docs/recovery.png)
-
-```
-$ python tools/serve_broken.py build/Giga_OTA.ino.bin truncate
-  sent 369640 of 739280 bytes, then truncate
-```
-
-The board gave up on its own, said so, and **did not touch
-`/fs/UPDATE.BIN`** - then took the next good update normally. That last part
-is the half people forget to test: recovering is not just surviving the
-failure, it is still being updatable afterwards.
-
-No compression, no container, no `decompress()` - `download()` fetched the
-raw binary and `copyRawToUpdateBin()` moved it to the name the bootloader
-wants. That is the entire packaging story on Windows.
-
-If the remaining boxes stay unticked, this README explains how far it got and
-why, which is the useful half either way.
-
-## Licence
-
-MIT.
+Copyright (C) 2026 Noah Christian. MIT License.

@@ -14,3 +14,8 @@ tools/captures/
 
 # The OTA signing key. Leaking it lets anyone sign firmware for these boards.
 ota_private_key.pem
+
+# Private working notes and machine-local tool settings. CLAUDE.md imports
+# CLAUDE.local.md; a clone without it just skips the import.
+CLAUDE.local.md
+.claude/settings.local.json
