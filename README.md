@@ -164,9 +164,18 @@ Magic last, so the device finds it by seeking to the end. The signature covers
 the firmware only, and the verified length tells staging where to stop - the
 bootloader never sees the trailer. Costs ~48 kB of flash.
 
-**Rotating the key means USB-flashing every board**, since a board only accepts
-images signed by the key it already carries. That is the property doing the
-work.
+A board only accepts images signed by the key it already carries. That is the
+property doing the work - and it does **not** mean rotating the key costs a
+USB flash, which an earlier version of this paragraph claimed. The new public
+key travels inside a firmware image, and that image is checked against the
+key the board is still carrying, so the rollover is an ordinary OTA: build
+the firmware carrying the new key, sign it with the **old** private key, and
+the board accepts it, installs it and comes back carrying the new one.
+
+USB is the cost only if the **old private key is lost** - then nothing can
+sign the transition image. That is the reason to back up
+`ota_private_key.pem`, and it is a better reason than the one this paragraph
+used to give.
 
 ### What signing does not give you
 

@@ -72,9 +72,24 @@ with open(PUBH, "w", encoding="utf-8", newline="\n") as f:
   mbedtls_pk_parse_public_key() wants the terminating NUL counted in the
   length, which is why the sketch passes sizeof() rather than strlen().
 
-  Replacing this key requires a USB flash of every board: a board only
-  accepts images signed by the key it is already carrying, which is exactly
-  the property that makes signing worth doing.
+  A board only accepts images signed by the key it is already carrying, which
+  is exactly the property that makes signing worth doing.
+
+  THAT DOES NOT MEAN REPLACING THE KEY NEEDS A USB FLASH. An earlier version
+  of this comment said it did, and it was wrong in a way that discourages the
+  thing it should encourage: rotating a key. The new key travels INSIDE a
+  firmware image, and that image is verified against the key the board is
+  still carrying, so the rollover is an ordinary OTA:
+
+      1. build the firmware that carries the NEW public key
+      2. sign that image with the OLD private key
+      3. the board verifies it against the old key, installs it, and reboots
+         carrying the new one
+      4. every image after that is signed with the new private key
+
+  USB is required only if the OLD PRIVATE KEY IS LOST. Then nothing can sign
+  the transition image and there is no way back in without a cable. That is
+  the real reason to back up ota_private_key.pem.
 */
 #ifndef OTA_PUBKEY_H
 #define OTA_PUBKEY_H
@@ -88,4 +103,6 @@ static const char OTA_PUBLIC_KEY_PEM[] =
 print("wrote %s  (SECRET - gitignored, back it up)" % PRIV)
 print("wrote %s  (public, commit this)" % PUBH)
 print()
-print("Boards must be USB-flashed once with this key before signed OTA works.")
+print("A board with NO key yet must be USB-flashed once to receive this one.")
+print("A board already carrying a key does NOT: sign the image that carries")
+print("the new key with the OLD private key and send it over the air.")
