@@ -7,9 +7,25 @@
   mbedtls_pk_parse_public_key() wants the terminating NUL counted in the
   length, which is why the sketch passes sizeof() rather than strlen().
 
-  Replacing this key requires a USB flash of every board: a board only
-  accepts images signed by the key it is already carrying, which is exactly
-  the property that makes signing worth doing.
+  A board only accepts images signed by the key it is already carrying, which
+  is exactly the property that makes signing worth doing.
+
+  THAT DOES NOT MEAN REPLACING THE KEY NEEDS A USB FLASH. An earlier version
+  of this comment said it did, and it was wrong in a way that discourages the
+  thing it should encourage: rotating a key. The new key travels INSIDE a
+  firmware image, and that image is verified against the key the board is
+  still carrying, so the rollover is an ordinary OTA:
+
+      1. build the firmware that carries the NEW public key
+      2. sign that image with the OLD private key
+      3. the board verifies it against the old key, installs it, and reboots
+         carrying the new one
+      4. every image after that is signed with the new private key
+
+  USB is required only if the OLD PRIVATE KEY IS LOST. Then nothing can sign
+  the transition image and there is no way back in without a cable. That is
+  the real reason to back up ota_private_key.pem, and it is a better reason
+  than the one this comment used to give.
 */
 #ifndef OTA_PUBKEY_H
 #define OTA_PUBKEY_H
