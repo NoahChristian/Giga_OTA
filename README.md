@@ -24,6 +24,17 @@ python tools/dump_screen.py COMx after                     # read the result bac
 Needs the `Arduino_Portenta_OTA` library, plus `pyserial` and `cryptography`
 for the tools. `COMx` is the board's serial port, e.g. `COM3`.
 
+Three deep-dives sit beside this page, for the questions that outgrew a section:
+
+| | |
+| --- | --- |
+| [docs/SECURITY.md](docs/SECURITY.md) | key handling, what the signature does not cover, and the ways a signing scheme is lost without the cryptography being touched |
+| [docs/RELIABILITY.md](docs/RELIABILITY.md) | surviving a complete, correctly signed image that does not boot - which this sketch does **not** do |
+| [docs/ZEPHYR.md](docs/ZEPHYR.md) | the Zephyr and MCUboot route, measured on hardware |
+
+Each claim in them is tagged by where it was measured, because most of this was
+learned on boards that had already moved to a dual-slot bootloader.
+
 ---
 
 ## Background
@@ -189,6 +200,14 @@ used to give.
 - **`OTA_REQUIRE_SIGNATURE` can be turned off.** It exists for bringing up a
   board before you have a key. Shipping with it off means anyone who can
   answer the URL owns the device.
+- **No secrecy for anything else in flash.** The Arduino bootloader's DFU
+  descriptor marks only sector 0 read-only (`01*128Ka`); everything above it
+  reads back over USB. `arduino_secrets.h` is compiled in, so every copy of an
+  image you serve carries the network credentials. See
+  [docs/SECURITY.md](docs/SECURITY.md).
+- **A signature says nothing about whether the image runs.** It is checked
+  before staging, and the bootloader installs what it is given. See
+  [docs/RELIABILITY.md](docs/RELIABILITY.md).
 
  **The trigger is local.** An update only starts when the unit commands it. This is somewhat by architecture in where it must be initiated. You can, for example send an MQTT or Red packet to initiate an update, but with a larger security surface to consider.
 
@@ -210,6 +229,13 @@ Two guards:
 
 - **A stall timeout**
 - **Refusal to stage anything shorter than `Content-Length`**
+
+Both guards are about the transfer. **A download that succeeds and delivers an
+image that does not boot is not covered by anything here** - there is one slot,
+and the bootloader installs what it is given. That is the gap a dual-slot
+bootloader closes, and [docs/RELIABILITY.md](docs/RELIABILITY.md) is about
+closing it.
+
 ---
 
 ## 6. Gotcha - WiFi sleeps and the Arduino API can't change it on the Giga
@@ -241,14 +267,29 @@ trusting the call; do not try to confirm it with ping times.
 
 ## 7. What about Zephyr?
 
-The mbed cores are end-of-life and `ArduinoCore-zephyr` 1.0.0 lists the GIGA
-R1. **Not yet, if you need a screen** - that core ships no display library and
-no LVGL. The only trace of the Display Shield is a devicetree binding for its
-DSI bridge (`analogix,anx7625.yaml`); nothing drives it from a sketch.
+The mbed cores are end-of-life, so this is not an optional direction. There are
+two Zephyr routes and they are not equally capable.
 
-Most of this transfers: Zephyr's own OTA library writes to the same
-QSPI OTA partition and lets *the mbed bootloader* apply it, over plain HTTP.
-Same bootloader, same partitions, same hosting. The sketch-side API and the image format change.
+**`ArduinoCore-zephyr`** keeps the `.ino` form and lists the GIGA R1, and it is
+the one that ships no display library and no LVGL - the only trace of the
+Display Shield is a devicetree binding for its DSI bridge
+(`analogix,anx7625.yaml`). It also cannot change devicetree or Kconfig without
+rebuilding its prebuilt loader, and an OTA flash map *is* a devicetree change.
+
+**Native Zephyr can do all of it today**, screen included: LVGL is in-tree and
+`-DSHIELD=arduino_giga_display_shield` supplies the panel, the GT911 touch
+controller and the SDRAM framebuffer, upstream, contributed by Arduino SA.
+
+From there, two choices. Keep the mbed bootloader and write the same QSPI OTA
+partition this repo documents - same bootloader, same partitions, same hosting,
+and the same single slot with no way back. Or install MCUboot and get dual-slot
+updates with **automatic revert**, so an image that does not boot costs one
+reboot instead of a trip to the board.
+
+[`docs/ZEPHYR.md`](docs/ZEPHYR.md) has the layout that fits a GIGA, the install
+path, and the two traps that cost the most: the flash partition has to be
+widened, and on a dual-core H7 describing the real 2 MB makes the driver
+compute 4 MB and misroute every bank-2 write.
 
 ---
 
@@ -282,7 +323,11 @@ hit-testing and click bubbling.
       in the same boot
 - [x] Recovery from an interrupted download, and updatable afterwards
 - [x] WHD powersave disable confirmed `2 -> 0`
+- [ ] Revert - a complete, correctly signed image that does not boot costs a
+      trip to the board. Dual-slot test-and-confirm is the fix
+      ([docs/RELIABILITY.md](docs/RELIABILITY.md))
 - [ ] Rollback protection - currently, older valid firmware images can be installed
+- [ ] Credentials out of the image and into a partition the update does not touch
 - [ ] HTTPS path
 
 ## License
