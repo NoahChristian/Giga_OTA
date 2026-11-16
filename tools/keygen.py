@@ -17,10 +17,16 @@ Writes two files:
                         and compiled into the firmware. Public keys are
                         public; there is nothing to protect here.
 
-Changing the key means re-flashing every board over USB, because a board only
-accepts images signed by the key it already carries. That is the whole point,
-and it is also why you should generate it once and keep the private key safe
-rather than regenerating it casually.
+A board only accepts images signed by the key it already carries. That is the
+whole point - and it does NOT mean replacing the key needs a USB flash. The
+new public key travels inside a firmware image signed with the OLD private
+key, so the rollover is an ordinary OTA. See the long note further down this
+file, next to the template that writes ota_pubkey.h.
+
+USB is the cost only if the OLD PRIVATE KEY IS LOST, because then nothing can
+sign the transition image. That is the reason to back the private key up, and
+it is a better reason than "rotation is awkward" - which is the kind of
+warning that stops a key ever being rotated at all.
 
 Usage:
     python keygen.py [--force]
