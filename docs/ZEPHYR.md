@@ -245,7 +245,73 @@ Three recovery notes, all **measured, other board**:
 | "`update()` recorded it, the bootloader applied it" | Same distinction, different names. Still the thing that misleads people. |
 | Content-Length and stall guards | Replaced by the SMP transport's own framing, and still not security. |
 | Screen capture and simulated taps over serial | The same technique works - a shell command that dumps the framebuffer, and one that injects a tap in logical coordinates. The double-rotation trap in the README's bonus section applies identically: **an LVGL pointer read callback returns raw native coordinates and LVGL rotates them itself.** |
-| **The WiFi powersave finding (section 6)** | **Does not transfer as written.** It is a fact about a symbol inside the shipped `libmbed.a`. Zephyr's AIROC driver is a different code path and has not been measured here. Do not assume either the problem or the fix. |
+| **The WiFi powersave finding (section 6)** | **Now measured. The problem transfers; the fix does not.** Zephyr ships the same WHD sources, with the same unconditional PM2 and the same 200 ms return-to-sleep delay. But the AIROC driver exposes no power save operation at all, so the obvious Zephyr-native fix silently does nothing. See below. |
+
+### 7.1 The powersave finding under Zephyr - measured
+
+Section 6 of the README documents PM2 being enabled behind your back by
+`whd_wifi_on()`, found by disassembling the shipped `libmbed.a`. This table
+used to say that whether any of it applied under Zephyr had never been
+measured, and that neither the problem nor the fix should be assumed. It has
+now been measured, on an STM32H7 carrier with the same CYW4343W radio running
+native Zephyr.
+
+**The problem transfers exactly.** Zephyr's AIROC module ships the same WHD
+sources, and the enable is in the same place and unconditional:
+
+```c
+/* modules/hal/infineon/whd-expansion/WHD/COMPONENT_WIFI5/src/whd_management.c */
+whd_wifi_enable_powersave_with_throughput(ifp, DEFAULT_PM2_SLEEP_RET_TIME);
+```
+
+with `DEFAULT_PM2_SLEEP_RET_TIME` defined as `200` - the same constant the
+disassembly showed as `movs r1, #200`. Same radio, same stack underneath, same
+behavior.
+
+**The Zephyr-native fix does not exist, and fails silently.** Zephyr defines
+`NET_REQUEST_WIFI_PS` and a `wifi_ps_params` struct, so this compiles and looks
+correct:
+
+```c
+struct wifi_ps_params ps = { .enabled = WIFI_PS_DISABLED };
+net_mgmt(NET_REQUEST_WIFI_PS, iface, &ps, sizeof(ps));
+```
+
+It does nothing. The AIROC driver's `wifi_mgmt_ops` table has no
+`.set_power_save` and no `.get_power_save` - it offers `scan`, `connect`,
+`disconnect`, `ap_enable`, `ap_disable`, `iface_status` and `get_stats`. The
+request returns `-ENOTSUP`. On a board with no console the warning saying so is
+never seen, and the call sits there looking like a fix.
+
+**The mbed workaround is the one that works, one layer down.** The WHD calls
+link from application code, and the driver exposes the interface:
+
+```c
+whd_interface_t airoc_wifi_get_whd_interface(void);   /* drivers/wifi/infineon/airoc_wifi.h */
+
+whd_interface_t ifp = airoc_wifi_get_whd_interface();
+uint32_t before = 99, after = 99;
+
+whd_wifi_get_powersave_mode(ifp, &before);
+whd_wifi_disable_powersave(ifp);
+whd_wifi_get_powersave_mode(ifp, &after);     /* 0 == NO_POWERSAVE_MODE */
+```
+
+Call it after the join, for the reason this repo already gives: powering the
+radio up re-arms PM2. And read the mode back - that discipline is this repo's,
+and it is what caught the `net_mgmt` version doing nothing.
+
+**What it was worth, and what it was not.** On that board the first HTTP
+request after an idle moment took 1467 ms where the same document takes 63-102
+ms on a woken link. Most of the remaining apparent slowness turned out to be
+the host resolving `.local` on every request rather than anything on the
+device - worth separating before blaming the radio.
+
+**It did not fix a stalled OTA there.** Large uploads kept failing with
+powersave confirmed off and the mode read back as `0`. The symptom this repo
+predicts - "a large inbound download can stall" - was present, but removing PM2
+was not sufficient to clear it, and the cause on that bench was never
+identified. Reported as a negative result rather than left as an implication.
 
 One more Zephyr-side gotcha that will cost a build cycle, **measured, other
 board**: the upstream Kconfig defaults that select the AIROC WiFi part are set
@@ -270,5 +336,7 @@ the workspace, the radio does not come up at all.
   safer variant and the only one on assemblies without BOOT0.
 - The signing *idea* transfers; the container does not. The key-handling
   discipline in [`SECURITY.md`](SECURITY.md) matters more, not less.
-- The WiFi powersave fix in README section 6 is mbed-specific. Do not carry it
-  across on faith.
+- The WiFi powersave *problem* in README section 6 does carry across: Zephyr
+  ships the same WHD with the same unconditional PM2. The *fix* does not -
+  `NET_REQUEST_WIFI_PS` returns `-ENOTSUP` on the AIROC driver and changes
+  nothing. Call WHD directly and read the mode back. Section 7.1.
